@@ -1,0 +1,27 @@
+# Ignore everything by default
+*
+
+# Include only what's needed for the skill
+!SKILL.md
+!README.md
+!LICENSE
+!scripts/
+!scripts/sn.sh
+!.clawhubignore
+
+# Explicitly exclude sensitive and temp files
+.env
+.env.*
+*.credentials
+*.key
+*.pem
+*.secret
+.mcp.json
+*.log
+*.tmp
+*.bak
+*~
+.DS_Store
+node_modules/
+test/
+tests/
