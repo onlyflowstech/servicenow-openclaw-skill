@@ -156,6 +156,87 @@ Returns field names, types, max lengths, mandatory flags, reference targets, and
 
 Use `--fields-only` for a compact field list.
 
+### sn_batch — Bulk update or delete records
+
+```bash
+bash scripts/sn.sh batch <table> --query "<encoded_query>" --action <update|delete> [--fields '{"field":"value"}'] [--limit 200] [--confirm]
+```
+
+Performs bulk update or delete operations on all records matching a query. Runs in **dry-run mode by default** — shows how many records match without making changes. Pass `--confirm` to execute.
+
+Options:
+- `--query "<encoded_query>"` — Filter records to operate on (required)
+- `--action <update|delete>` — Operation to perform (required)
+- `--fields '<json>'` — JSON fields to set on each record (required for update)
+- `--limit <n>` — Max records to affect per run (default 200, safety cap at 10000)
+- `--dry-run` — Show match count only, no changes (default behavior)
+- `--confirm` — Actually execute the operation (disables dry-run)
+
+Examples:
+
+```bash
+# Dry run: see how many resolved incidents older than 90 days would be affected
+bash scripts/sn.sh batch incident --query "state=6^sys_updated_on<javascript:gs.daysAgo(90)" --action update
+
+# Bulk close resolved incidents (actually execute)
+bash scripts/sn.sh batch incident --query "state=6^sys_updated_on<javascript:gs.daysAgo(90)" --action update --fields '{"state":"7","close_code":"Solved (Permanently)","close_notes":"Auto-closed by batch"}' --confirm
+
+# Dry run: count orphaned test records
+bash scripts/sn.sh batch u_test_table --query "u_status=abandoned" --action delete
+
+# Delete orphaned records (actually execute)
+bash scripts/sn.sh batch u_test_table --query "u_status=abandoned" --action delete --limit 50 --confirm
+```
+
+Output (JSON summary):
+```json
+{"action":"update","table":"incident","matched":47,"processed":47,"failed":0}
+```
+
+### sn_health — Instance health check
+
+```bash
+bash scripts/sn.sh health [--check <all|version|nodes|jobs|semaphores|stats>]
+```
+
+Checks ServiceNow instance health across multiple dimensions. Default is `--check all` which runs every check.
+
+Checks:
+- **version** — Instance build version, date, and tag from sys_properties
+- **nodes** — Cluster node status (online/offline) from sys_cluster_state
+- **jobs** — Stuck/overdue scheduled jobs from sys_trigger (state=ready, next_action > 30 min past)
+- **semaphores** — Active semaphores (potential locks) from sys_semaphore
+- **stats** — Quick dashboard: active incidents, open P1s, active changes, open problems
+
+Examples:
+
+```bash
+# Full health check
+bash scripts/sn.sh health
+
+# Just check version
+bash scripts/sn.sh health --check version
+
+# Check for stuck jobs
+bash scripts/sn.sh health --check jobs
+
+# Quick incident/change/problem dashboard
+bash scripts/sn.sh health --check stats
+```
+
+Output (JSON):
+```json
+{
+  "instance": "https://yourinstance.service-now.com",
+  "timestamp": "2026-02-16T13:30:00Z",
+  "version": {"build": "...", "build_date": "...", "build_tag": "..."},
+  "nodes": [{"node_id": "...", "status": "online", "system_id": "..."}],
+  "jobs": {"stuck": 0, "overdue": []},
+  "semaphores": {"active": 2, "list": []},
+  "stats": {"incidents_active": 54, "p1_open": 3, "changes_active": 12, "problems_open": 8}
+}
+```
+
 ### sn_attach — Manage attachments
 
 ```bash
