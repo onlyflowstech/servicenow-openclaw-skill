@@ -9,7 +9,7 @@
 # License: MIT
 # ──────────────────────────────────────────────────────────────────────
 # Usage: bash sn.sh <command> [args...]
-# Commands: query, get, create, update, delete, aggregate, schema, attach, batch, health
+# Commands: query, get, create, update, delete, aggregate, schema, attach, batch, health, nl, relationships
 set -euo pipefail
 
 # ── Configuration ──────────────────────────────────────────────────────
@@ -1248,6 +1248,343 @@ cmd_nl() {
   esac
 }
 
+# ── relationships ───────────────────────────────────────────────────────
+cmd_relationships() {
+  local ci_name="" opt_sys_id="" depth=1 rel_type="" ci_class="" direction="both"
+  local impact=false json_output=false
+
+  # Parse arguments
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --sys-id)    opt_sys_id="$2"; shift 2 ;;
+      --depth)     depth="$2";      shift 2 ;;
+      --type)      rel_type="$2";   shift 2 ;;
+      --class)     ci_class="$2";   shift 2 ;;
+      --direction) direction="$2";  shift 2 ;;
+      --impact)    impact=true;     shift ;;
+      --json)      json_output=true; shift ;;
+      -*)          die "Unknown option: $1" ;;
+      *)
+        if [[ -z "$ci_name" ]]; then
+          ci_name="$1"
+        else
+          die "Unexpected argument: $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  [[ -z "$ci_name" && -z "$opt_sys_id" ]] && die "Usage: sn.sh relationships <ci_name> [--sys-id <id>] [--depth N] [--type <type>] [--class <class>] [--direction upstream|downstream|both] [--impact] [--json]"
+  [[ "$depth" -lt 1 || "$depth" -gt 5 ]] && die "--depth must be between 1 and 5"
+
+  if [[ "$impact" == "true" ]]; then
+    direction="upstream"
+    info "Impact analysis mode — walking upstream only"
+  fi
+
+  case "$direction" in
+    upstream|downstream|both) ;;
+    *) die "--direction must be upstream, downstream, or both" ;;
+  esac
+
+  # ── Step 1: Resolve root CI ──────────────────────────────────────
+  local root_id root_name root_class
+
+  if [[ -n "$opt_sys_id" ]]; then
+    info "Resolving CI by sys_id: $opt_sys_id"
+    local ci_resp
+    ci_resp=$(sn_curl GET "${SN_INSTANCE}/api/now/table/cmdb_ci/${opt_sys_id}?sysparm_fields=sys_id,name,sys_class_name&sysparm_display_value=true") \
+      || die "Failed to resolve CI with sys_id: $opt_sys_id"
+    root_id="$opt_sys_id"
+    root_name=$(echo "$ci_resp" | jq -r '.result.name // empty')
+    root_class=$(echo "$ci_resp" | jq -r '.result.sys_class_name // empty')
+    [[ -z "$root_name" ]] && die "CI not found with sys_id: $opt_sys_id"
+  else
+    info "Resolving CI: $ci_name"
+    local encoded_name
+    encoded_name=$(jq -rn --arg v "$ci_name" '$v | @uri')
+    local ci_resp
+    ci_resp=$(sn_curl GET "${SN_INSTANCE}/api/now/table/cmdb_ci?sysparm_query=name=${encoded_name}&sysparm_fields=sys_id,name,sys_class_name&sysparm_display_value=true&sysparm_limit=5") \
+      || die "Failed to search for CI: $ci_name"
+
+    local match_count
+    match_count=$(echo "$ci_resp" | jq '.result | length')
+    [[ "$match_count" -eq 0 ]] && die "CI not found: $ci_name"
+    [[ "$match_count" -gt 1 ]] && info "Found $match_count CIs matching '$ci_name', using first match"
+
+    root_id=$(echo "$ci_resp" | jq -r '.result[0].sys_id')
+    root_name=$(echo "$ci_resp" | jq -r '.result[0].name')
+    root_class=$(echo "$ci_resp" | jq -r '.result[0].sys_class_name')
+  fi
+
+  info "Root CI: $root_name ($root_class) [$root_id]"
+
+  # ── Caches ───────────────────────────────────────────────────────
+  declare -A _rel_visited        # cycle detection
+  declare -A _rel_class_cache    # CI class cache
+  _rel_visited["$root_id"]=1
+  _rel_class_cache["$root_id"]="$root_class"
+
+  # JSON accumulator
+  local _rel_json_result='[]'
+
+  # Display dedup for class-filtered results
+  declare -A _rel_displayed
+
+  # ── Helper: get CI class with caching ────────────────────────────
+  _rel_get_class() {
+    local cid="$1"
+    if [[ -n "${_rel_class_cache[$cid]+x}" ]]; then
+      echo "${_rel_class_cache[$cid]}"
+      return
+    fi
+    local resp cls
+    resp=$(sn_curl GET "${SN_INSTANCE}/api/now/table/cmdb_ci/${cid}?sysparm_fields=sys_class_name&sysparm_display_value=true" 2>/dev/null) || true
+    cls=$(echo "$resp" | jq -r '.result.sys_class_name // "unknown"' 2>/dev/null)
+    [[ -z "$cls" ]] && cls="unknown"
+    _rel_class_cache["$cid"]="$cls"
+    echo "$cls"
+  }
+
+  # ── Helper: extract value/display from a field (handles both formats) ─
+  # With sysparm_display_value=all, reference fields return:
+  #   {"display_value":"Name","value":"sys_id","link":"https://..."}
+  # With sysparm_display_value=true, they may return just a string.
+  _rel_field_value() {
+    local field_json="$1" key="$2"
+    local val
+    val=$(echo "$field_json" | jq -r ".$key.value // empty" 2>/dev/null)
+    if [[ -z "$val" ]]; then
+      # Might be a plain string
+      val=$(echo "$field_json" | jq -r ".$key // empty" 2>/dev/null)
+      # If it looks like a sys_id (32 hex chars), use it
+      if [[ ! "$val" =~ ^[a-f0-9]{32}$ ]]; then
+        val=""
+      fi
+    fi
+    echo "$val"
+  }
+
+  _rel_field_display() {
+    local field_json="$1" key="$2"
+    local disp
+    disp=$(echo "$field_json" | jq -r ".$key.display_value // empty" 2>/dev/null)
+    if [[ -z "$disp" ]]; then
+      disp=$(echo "$field_json" | jq -r ".$key // empty" 2>/dev/null)
+      # If it's a sys_id, it's not a display value
+      if [[ "$disp" =~ ^[a-f0-9]{32}$ ]]; then
+        disp=""
+      fi
+    fi
+    echo "$disp"
+  }
+
+  _rel_field_id_from_link() {
+    local field_json="$1" key="$2"
+    local link
+    link=$(echo "$field_json" | jq -r ".$key.link // empty" 2>/dev/null)
+    if [[ -n "$link" ]]; then
+      echo "${link##*/}"
+    fi
+  }
+
+  # ── Recursive traversal ─────────────────────────────────────────
+  _rel_traverse() {
+    local current_id="$1" current_depth="$2" max_depth="$3" prefix="$4"
+
+    [[ "$current_depth" -gt "$max_depth" ]] && return 0
+
+    # Query relationships for this CI
+    local query="parent=${current_id}^ORchild=${current_id}"
+    local encoded_q
+    encoded_q=$(jq -rn --arg v "$query" '$v | @uri')
+    local url="${SN_INSTANCE}/api/now/table/cmdb_rel_ci?sysparm_query=${encoded_q}&sysparm_fields=parent,child,type&sysparm_display_value=all&sysparm_limit=100"
+
+    local rel_resp
+    rel_resp=$(sn_curl GET "$url" 2>/dev/null) || {
+      info "Warning: Failed to query relationships for $current_id"
+      return 0
+    }
+
+    local rel_count
+    rel_count=$(echo "$rel_resp" | jq '.result | length')
+    [[ "$rel_count" -eq 0 ]] && return 0
+
+    # ── Parse and filter relationships ─────────────────────────────
+    # Build a list of: other_id, other_name, rel_type_name, rel_direction
+    local items='[]'
+    local seen_pairs=""  # dedup "id:direction" combos at this level
+
+    local i=0
+    while (( i < rel_count )); do
+      local rec
+      rec=$(echo "$rel_resp" | jq -c ".result[$i]")
+
+      # Extract parent info
+      local p_id p_name p_link_id
+      p_id=$(_rel_field_value "$rec" "parent")
+      p_name=$(_rel_field_display "$rec" "parent")
+      [[ -z "$p_id" ]] && p_id=$(_rel_field_id_from_link "$rec" "parent")
+
+      # Extract child info
+      local c_id c_name c_link_id
+      c_id=$(_rel_field_value "$rec" "child")
+      c_name=$(_rel_field_display "$rec" "child")
+      [[ -z "$c_id" ]] && c_id=$(_rel_field_id_from_link "$rec" "child")
+
+      # Extract relationship type
+      local type_display
+      type_display=$(_rel_field_display "$rec" "type")
+      [[ -z "$type_display" ]] && type_display="Related to"
+
+      # Determine direction and other CI
+      local other_id other_name rel_dir
+      if [[ "$p_id" == "$current_id" ]]; then
+        other_id="$c_id"
+        other_name="$c_name"
+        rel_dir="downstream"
+      elif [[ "$c_id" == "$current_id" ]]; then
+        other_id="$p_id"
+        other_name="$p_name"
+        rel_dir="upstream"
+      else
+        # Neither matches (shouldn't happen)
+        i=$((i + 1)); continue
+      fi
+
+      # Skip self-references
+      [[ "$other_id" == "$current_id" ]] && { i=$((i + 1)); continue; }
+
+      # Direction filter
+      if [[ "$direction" != "both" && "$rel_dir" != "$direction" ]]; then
+        i=$((i + 1)); continue
+      fi
+
+      # Type filter (substring match)
+      if [[ -n "$rel_type" ]]; then
+        if [[ "${type_display,,}" != *"${rel_type,,}"* ]]; then
+          i=$((i + 1)); continue
+        fi
+      fi
+
+      # Dedup at this level
+      local pair_key="${other_id}:${rel_dir}"
+      if [[ "$seen_pairs" == *"|${pair_key}|"* ]]; then
+        i=$((i + 1)); continue
+      fi
+      seen_pairs+="|${pair_key}|"
+
+      items=$(echo "$items" | jq \
+        --arg oid "$other_id" \
+        --arg oname "$other_name" \
+        --arg tname "$type_display" \
+        --arg dir "$rel_dir" \
+        '. + [{"id": $oid, "name": $oname, "type": $tname, "direction": $dir}]')
+
+      i=$((i + 1))
+    done
+
+    # ── Resolve classes for all items (needed for filtering + display) ─
+    # Pre-fetch classes into cache to avoid redundant lookups
+    local total
+    total=$(echo "$items" | jq 'length')
+    [[ "$total" -eq 0 ]] && return 0
+
+    local k=0
+    while [[ $k -lt $total ]]; do
+      local prefetch_id
+      prefetch_id=$(echo "$items" | jq -r ".[$k].id")
+      _rel_get_class "$prefetch_id" >/dev/null
+      k=$((k + 1))
+    done
+
+    # ── Output this level + recurse ────────────────────────────────
+    k=0
+    while [[ $k -lt $total ]]; do
+      local item_id item_name item_type item_dir
+      item_id=$(echo "$items" | jq -r ".[$k].id")
+      item_name=$(echo "$items" | jq -r ".[$k].name")
+      item_type=$(echo "$items" | jq -r ".[$k].type")
+      item_dir=$(echo "$items" | jq -r ".[$k].direction")
+
+      local item_class
+      item_class="${_rel_class_cache[$item_id]:-unknown}"
+
+      # Check class filter — skip display but still traverse
+      local show_item=true
+      if [[ -n "$ci_class" ]]; then
+        if [[ "${item_class,,}" != *"${ci_class,,}"* ]]; then
+          show_item=false
+        elif [[ -n "${_rel_displayed[$item_id]+x}" ]]; then
+          show_item=false  # already displayed via another branch
+        fi
+      fi
+
+      # Tree connectors
+      local connector child_prefix
+      if [[ $k -eq $((total - 1)) ]]; then
+        connector="└─"
+        child_prefix="${prefix}   "
+      else
+        connector="├─"
+        child_prefix="${prefix}│  "
+      fi
+
+      # Direction indicator
+      local dir_arrow
+      [[ "$item_dir" == "upstream" ]] && dir_arrow="▲" || dir_arrow="▼"
+
+      if [[ "$show_item" == "true" ]]; then
+        _rel_displayed["$item_id"]=1
+
+        if [[ "$json_output" == "true" ]]; then
+          _rel_json_result=$(echo "$_rel_json_result" | jq \
+            --arg name "$item_name" --arg cls "$item_class" \
+            --arg type "$item_type" --arg dir "$item_dir" \
+            --arg id "$item_id" --argjson dep "$current_depth" \
+            '. + [{"name": $name, "class": $cls, "type": $type, "direction": $dir, "sys_id": $id, "depth": $dep}]')
+        else
+          echo "${prefix}${connector} ${dir_arrow} ${item_name} [${item_class}] (${item_type})"
+        fi
+      fi
+
+      # Recurse deeper if allowed and not visited
+      if [[ "$current_depth" -lt "$max_depth" ]] && [[ -z "${_rel_visited[$item_id]+x}" ]]; then
+        _rel_visited["$item_id"]=1
+        _rel_traverse "$item_id" $(( current_depth + 1 )) "$max_depth" "$child_prefix"
+      fi
+
+      k=$((k + 1))
+    done
+  }
+
+  # ── Print header and start traversal ─────────────────────────────
+  if [[ "$json_output" != "true" ]]; then
+    echo ""
+    echo "● $root_name [$root_class]"
+  fi
+
+  _rel_traverse "$root_id" 1 "$depth" ""
+
+  if [[ "$json_output" == "true" ]]; then
+    local root_json
+    root_json=$(jq -n \
+      --arg name "$root_name" --arg cls "$root_class" --arg id "$root_id" \
+      --argjson rels "$_rel_json_result" \
+      '{root: {name: $name, class: $cls, sys_id: $id}, relationships: $rels}')
+    echo "$root_json" | jq .
+  else
+    local rel_count_final
+    rel_count_final=$(echo "$_rel_json_result" | jq 'length' 2>/dev/null || echo "0")
+    echo ""
+    info "Found relationships (depth=$depth, direction=$direction)"
+  fi
+
+  # Clean up functions
+  unset -f _rel_get_class _rel_field_value _rel_field_display _rel_field_id_from_link _rel_traverse
+}
+
 # ── Main dispatcher ────────────────────────────────────────────────────
 cmd="${1:?Usage: sn.sh <query|get|create|update|delete|aggregate|schema|attach|batch|health|nl> ...}"
 shift
@@ -1263,6 +1600,7 @@ case "$cmd" in
   attach)    cmd_attach "$@" ;;
   batch)     cmd_batch "$@" ;;
   health)    cmd_health "$@" ;;
-  nl)        cmd_nl "$@" ;;
-  *)         die "Unknown command: $cmd" ;;
+  nl)            cmd_nl "$@" ;;
+  relationships) cmd_relationships "$@" ;;
+  *)             die "Unknown command: $cmd" ;;
 esac
