@@ -1,11 +1,11 @@
 # 🔧 ServiceNow Skill for OpenClaw
 
-**By [Emetrix Solutions](https://onlyflows.tech) | [Four Dragons LLC](https://onlyflows.tech)**
+**By [OnlyFlows](https://onlyflows.tech)**
 
 > Connect your AI agent to ServiceNow — full CRUD, analytics, schema introspection, and attachment management across every table in your instance.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![ClawHub](https://img.shields.io/badge/ClawHub-emetrixlabs%2Fservicenow-orange)](https://clawhub.dev/emetrixlabs/servicenow)
+[![ClawHub](https://img.shields.io/badge/ClawHub-onlyflows%2Fservicenow-orange)](https://clawhub.dev/onlyflows/servicenow)
 
 ---
 
@@ -35,13 +35,13 @@ Whether you're triaging incidents at 2 AM, auditing CMDB accuracy, or building c
 ## 📦 Installation
 
 ```bash
-clawhub install emetrixlabs/servicenow
+clawhub install onlyflows/servicenow
 ```
 
 Or clone manually into your skills directory:
 
 ```bash
-git clone https://github.com/emetrixlabs/openclaw-servicenow.git \
+git clone https://github.com/onlyflowstech/servicenow-openclaw-skill.git \
   ~/.openclaw/skills/servicenow
 ```
 
@@ -166,8 +166,8 @@ ServiceNow uses encoded query syntax for filtering. Here's a quick reference:
 
 **Brandon Wilson** — ServiceNow Certified Technical Architect (CTA)
 
-- 🏢 [Emetrix Solutions](https://onlyflows.tech) — ServiceNow consulting & AI integration
-- 🐉 [Four Dragons LLC](https://onlyflows.tech) — Technology innovation
+- 🌐 [OnlyFlows](https://onlyflows.tech) — ServiceNow tools, skills & AI automation
+
 - 🌐 [OnlyFlows.tech](https://onlyflows.tech) — Workflow automation & AI
 
 ---
@@ -176,13 +176,13 @@ ServiceNow uses encoded query syntax for filtering. Here's a quick reference:
 
 MIT License — see [LICENSE](LICENSE) for details.
 
-Copyright © 2026 Emetrix Solutions
+Copyright © 2026 OnlyFlows
 
 ---
 
 ## 🤝 Contributing
 
-Contributions welcome! Open an issue or PR at [github.com/emetrixlabs/openclaw-servicenow](https://github.com/emetrixlabs/openclaw-servicenow).
+Contributions welcome! Open an issue or PR at [github.com/onlyflowstech/servicenow-openclaw-skill](https://github.com/onlyflowstech/servicenow-openclaw-skill).
 
 Ideas for contribution:
 - Additional ServiceNow API support (CMDB API, Import Sets, Scripted REST)
