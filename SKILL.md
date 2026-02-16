@@ -237,6 +237,103 @@ Output (JSON):
 }
 ```
 
+### sn_nl — Natural Language Interface
+
+```bash
+bash scripts/sn.sh nl "<natural language text>" [--execute] [--confirm] [--force]
+```
+
+Translates natural language into the appropriate ServiceNow API call. Acts as a routing layer that parses intent, resolves table and field aliases, builds encoded queries, and either displays the planned command (dry-run) or executes it.
+
+**How it works:**
+1. Parses input text for table references, field values, operators, sort orders
+2. Resolves 100+ table aliases (e.g., "incidents" → `incident`, "servers" → `cmdb_ci_server`)
+3. Maps field aliases (P1 → `priority=1`, "open" → `active=true`, etc.)
+4. Detects intent: QUERY, AGGREGATE, CREATE, UPDATE, DELETE, BATCH, SCHEMA
+5. Builds the encoded query and outputs the exact `sn.sh` command
+6. Read operations execute immediately; write operations require `--execute`
+
+**Parameters:**
+- First argument: Natural language text (quoted)
+- `--execute` — Execute write operations (reads always execute)
+- `--confirm` — Required for batch/bulk operations
+- `--force` — Required for bulk deletes (in addition to `--confirm`)
+
+**Safety:**
+- ✅ Read operations (QUERY, AGGREGATE, SCHEMA) execute immediately
+- ⚠️ Write operations (CREATE, UPDATE) show dry-run by default, require `--execute`
+- ⚠️ Bulk writes (BATCH) require `--execute --confirm`
+- 🛑 Bulk deletes require `--execute --confirm --force`
+
+**Supported table aliases (30+):**
+- ITSM: incidents, changes, problems, tasks, requests, ritms
+- Users: users, people, groups, teams
+- CMDB: servers, computers, databases, applications, services, cis, network gear
+- Knowledge: articles, kb, knowledge
+- Catalog: catalog items, sc tasks
+- Admin: update sets, flows, business rules, notifications, properties
+
+**Examples:**
+
+```bash
+# 1. Query — list open P1 incidents
+bash scripts/sn.sh nl "show all P1 incidents"
+
+# 2. Query — incidents assigned to a specific group
+bash scripts/sn.sh nl "show incidents assigned to Network team"
+
+# 3. Aggregate — count open changes
+bash scripts/sn.sh nl "how many open changes are there"
+
+# 4. Aggregate — count by priority
+bash scripts/sn.sh nl "how many incidents grouped by priority"
+
+# 5. Schema — get table fields
+bash scripts/sn.sh nl "what fields are on the incident table"
+
+# 6. Query — list CMDB servers
+bash scripts/sn.sh nl "list servers in the CMDB"
+
+# 7. Query — recent records with sorting
+bash scripts/sn.sh nl "show tasks sorted by created date"
+
+# 8. Create — new incident (dry-run by default)
+bash scripts/sn.sh nl "create incident for email service down, P2, assign to Email Support"
+
+# 9. Create — execute write operation
+bash scripts/sn.sh nl "create incident for VPN outage, P1" --execute
+
+# 10. Query — find specific record
+bash scripts/sn.sh nl "show tasks for INC0000001"
+
+# 11. Batch — bulk close (dry-run)
+bash scripts/sn.sh nl "close all resolved incidents"
+
+# 12. Batch — execute bulk update
+bash scripts/sn.sh nl "close all resolved incidents" --execute --confirm
+
+# 13. Query — users and groups
+bash scripts/sn.sh nl "list all active users"
+
+# 14. Query — time-based filter
+bash scripts/sn.sh nl "show incidents from last week"
+
+# 15. Query — knowledge articles
+bash scripts/sn.sh nl "find knowledge articles about password reset"
+```
+
+**Output format:**
+```
+Intent:  QUERY
+Table:   incident
+Query:   priority=1^active=true
+Limit:   20
+Command: bash scripts/sn.sh query incident --query "priority=1^active=true" --fields number,short_description,state,priority,assigned_to,assignment_group,opened_at --limit 20 --display true
+
+Executing...
+[results]
+```
+
 ### sn_attach — Manage attachments
 
 ```bash

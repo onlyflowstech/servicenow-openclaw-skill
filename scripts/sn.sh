@@ -556,8 +556,700 @@ cmd_health() {
   echo "$output" | jq .
 }
 
+# ── nl (natural language) ───────────────────────────────────────────────
+cmd_nl() {
+  local input="" execute=false confirm=false force=false
+  # Gather all positional args as input text, plus flags
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --execute) execute=true; shift ;;
+      --confirm) confirm=true; shift ;;
+      --force)   force=true;   shift ;;
+      *)
+        if [[ -z "$input" ]]; then
+          input="$1"
+        else
+          input="$input $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  [[ -z "$input" ]] && die "Usage: sn.sh nl \"<natural language text>\" [--execute] [--confirm] [--force]"
+
+  # Lowercase the input for matching
+  local lower
+  lower=$(echo "$input" | tr '[:upper:]' '[:lower:]')
+
+  # ── TABLE ALIASES (30+ mappings) ──────────────────────────────────
+  declare -A TABLE_ALIASES=(
+    # ITSM core
+    ["incident"]="incident"
+    ["incidents"]="incident"
+    ["inc"]="incident"
+    ["ticket"]="incident"
+    ["tickets"]="incident"
+    ["change"]="change_request"
+    ["changes"]="change_request"
+    ["change request"]="change_request"
+    ["change requests"]="change_request"
+    ["chg"]="change_request"
+    ["problem"]="problem"
+    ["problems"]="problem"
+    ["prb"]="problem"
+    ["task"]="task"
+    ["tasks"]="task"
+    # User / group
+    ["user"]="sys_user"
+    ["users"]="sys_user"
+    ["people"]="sys_user"
+    ["person"]="sys_user"
+    ["group"]="sys_user_group"
+    ["groups"]="sys_user_group"
+    ["team"]="sys_user_group"
+    ["teams"]="sys_user_group"
+    # CMDB
+    ["server"]="cmdb_ci_server"
+    ["servers"]="cmdb_ci_server"
+    ["ci"]="cmdb_ci"
+    ["cis"]="cmdb_ci"
+    ["configuration item"]="cmdb_ci"
+    ["configuration items"]="cmdb_ci"
+    ["cmdb"]="cmdb_ci"
+    ["computer"]="cmdb_ci_computer"
+    ["computers"]="cmdb_ci_computer"
+    ["laptop"]="cmdb_ci_computer"
+    ["laptops"]="cmdb_ci_computer"
+    ["desktop"]="cmdb_ci_computer"
+    ["desktops"]="cmdb_ci_computer"
+    ["network"]="cmdb_ci_netgear"
+    ["network gear"]="cmdb_ci_netgear"
+    ["router"]="cmdb_ci_netgear"
+    ["routers"]="cmdb_ci_netgear"
+    ["switch"]="cmdb_ci_netgear"
+    ["switches"]="cmdb_ci_netgear"
+    ["database"]="cmdb_ci_database"
+    ["databases"]="cmdb_ci_database"
+    ["db"]="cmdb_ci_database"
+    ["application"]="cmdb_ci_appl"
+    ["applications"]="cmdb_ci_appl"
+    ["app"]="cmdb_ci_appl"
+    ["apps"]="cmdb_ci_appl"
+    ["service"]="cmdb_ci_service"
+    ["services"]="cmdb_ci_service"
+    ["business service"]="cmdb_ci_service"
+    ["business services"]="cmdb_ci_service"
+    # Knowledge
+    ["knowledge"]="kb_knowledge"
+    ["knowledge article"]="kb_knowledge"
+    ["knowledge articles"]="kb_knowledge"
+    ["article"]="kb_knowledge"
+    ["articles"]="kb_knowledge"
+    ["kb"]="kb_knowledge"
+    # Service Catalog
+    ["catalog item"]="sc_cat_item"
+    ["catalog items"]="sc_cat_item"
+    ["catalogue item"]="sc_cat_item"
+    ["catalogue items"]="sc_cat_item"
+    ["request"]="sc_request"
+    ["requests"]="sc_request"
+    ["req"]="sc_request"
+    ["requested item"]="sc_req_item"
+    ["requested items"]="sc_req_item"
+    ["ritm"]="sc_req_item"
+    ["ritms"]="sc_req_item"
+    ["sc task"]="sc_task"
+    ["catalog task"]="sc_task"
+    ["catalog tasks"]="sc_task"
+    # ITOM / Events
+    ["event"]="sysevent"
+    ["events"]="sysevent"
+    ["alert"]="em_alert"
+    ["alerts"]="em_alert"
+    # Other common
+    ["sla"]="task_sla"
+    ["slas"]="task_sla"
+    ["attachment"]="sys_attachment"
+    ["attachments"]="sys_attachment"
+    ["journal"]="sys_journal_field"
+    ["comments"]="sys_journal_field"
+    ["work note"]="sys_journal_field"
+    ["work notes"]="sys_journal_field"
+    ["audit"]="sys_audit"
+    ["audit log"]="sys_audit"
+    ["property"]="sys_properties"
+    ["properties"]="sys_properties"
+    ["scheduled job"]="sysauto"
+    ["scheduled jobs"]="sysauto"
+    ["script"]="sys_script"
+    ["business rule"]="sys_script"
+    ["business rules"]="sys_script"
+    ["ui policy"]="sys_ui_policy"
+    ["ui policies"]="sys_ui_policy"
+    ["client script"]="sys_script_client"
+    ["client scripts"]="sys_script_client"
+    ["update set"]="sys_update_set"
+    ["update sets"]="sys_update_set"
+    ["flow"]="sys_hub_flow"
+    ["flows"]="sys_hub_flow"
+    ["notification"]="sysevent_email_action"
+    ["notifications"]="sysevent_email_action"
+    ["email"]="sys_email"
+    ["emails"]="sys_email"
+    ["relationship"]="cmdb_rel_ci"
+    ["relationships"]="cmdb_rel_ci"
+    ["ci relationship"]="cmdb_rel_ci"
+    ["ci relationships"]="cmdb_rel_ci"
+  )
+
+  # ── Resolve table from input ──────────────────────────────────────
+  local resolved_table=""
+
+  # Try longest match first (multi-word aliases)
+  # Sort aliases by length descending so "change requests" matches before "change"
+  local sorted_aliases
+  sorted_aliases=$(for key in "${!TABLE_ALIASES[@]}"; do echo "$key"; done | awk '{print length, $0}' | sort -rn | cut -d' ' -f2-)
+
+  while IFS= read -r alias; do
+    [[ -z "$alias" ]] && continue
+    if [[ "$lower" == *"$alias"* ]]; then
+      resolved_table="${TABLE_ALIASES[$alias]}"
+      break
+    fi
+  done <<< "$sorted_aliases"
+
+  # If no alias matched, try to find a raw table name pattern (e.g. sys_user, cmdb_ci_*)
+  if [[ -z "$resolved_table" ]]; then
+    local raw_table
+    raw_table=$(echo "$lower" | grep -oP '[a-z][a-z_]+_[a-z_]+' | head -1)
+    if [[ -n "$raw_table" ]]; then
+      resolved_table="$raw_table"
+    fi
+  fi
+
+  # ── Detect intent ─────────────────────────────────────────────────
+  local intent=""
+
+  # Check for schema/fields intent first
+  if echo "$lower" | grep -qP '(schema|fields|columns|structure|what fields|describe table|table definition|field list)'; then
+    intent="SCHEMA"
+  # Check for aggregate/count
+  elif echo "$lower" | grep -qP '(how many|count of|total number|number of|count all|tally|sum of|average|avg of|minimum|maximum)'; then
+    intent="AGGREGATE"
+  # Check for create intent
+  elif echo "$lower" | grep -qP '(^create|^new|^add|^open|^log|^raise|^submit|^register)'; then
+    intent="CREATE"
+  # Check for update intent
+  elif echo "$lower" | grep -qP '(^update|^change|^set|^modify|^edit|^patch|^reassign|^escalate)'; then
+    intent="UPDATE"
+  # Check for batch intent
+  elif echo "$lower" | grep -qP '(close all|update all|delete all|bulk|mass update|mass close|batch)'; then
+    intent="BATCH"
+  # Check for delete intent
+  elif echo "$lower" | grep -qP '(^delete|^remove|^destroy|^purge)'; then
+    intent="DELETE"
+  # Default: QUERY (show, list, get, find, etc.)
+  else
+    intent="QUERY"
+  fi
+
+  # ── Parse priority ────────────────────────────────────────────────
+  local query_parts=()
+
+  # P1/P2/P3/P4 or "priority 1" etc.
+  if echo "$lower" | grep -qP '\bp1\b|priority\s*1|critical priority'; then
+    query_parts+=("priority=1")
+  elif echo "$lower" | grep -qP '\bp2\b|priority\s*2|high priority'; then
+    query_parts+=("priority=2")
+  elif echo "$lower" | grep -qP '\bp3\b|priority\s*3|moderate priority|medium priority'; then
+    query_parts+=("priority=3")
+  elif echo "$lower" | grep -qP '\bp4\b|priority\s*4|low priority'; then
+    query_parts+=("priority=4")
+  elif echo "$lower" | grep -qP '\bp5\b|priority\s*5|planning'; then
+    query_parts+=("priority=5")
+  fi
+
+  # ── Parse state ───────────────────────────────────────────────────
+  if echo "$lower" | grep -qP '\bopen\b|\bnew\b'; then
+    query_parts+=("active=true")
+  elif echo "$lower" | grep -qP '\bclosed\b|\bcomplete\b|\bcompleted\b'; then
+    query_parts+=("state=7")
+  elif echo "$lower" | grep -qP '\bresolved\b|\bfixed\b'; then
+    query_parts+=("state=6")
+  elif echo "$lower" | grep -qP '\bin progress\b|\bwork in progress\b|\bwip\b'; then
+    query_parts+=("state=2")
+  elif echo "$lower" | grep -qP '\bon hold\b|\bpending\b|\bwaiting\b'; then
+    query_parts+=("state=3")
+  elif echo "$lower" | grep -qP '\bactive\b'; then
+    query_parts+=("active=true")
+  elif echo "$lower" | grep -qP '\binactive\b|\barchived\b'; then
+    query_parts+=("active=false")
+  fi
+
+  # ── Parse assignment ──────────────────────────────────────────────
+  local assigned_to="" assignment_group=""
+
+  # "assigned to <person>" — use original input for proper case
+  if [[ "$input" =~ [Aa]ssigned[[:space:]]+[Tt]o[[:space:]]+([a-zA-Z][a-zA-Z[:space:]]+) ]]; then
+    assigned_to="${BASH_REMATCH[1]}"
+    # Trim trailing known keywords
+    assigned_to=$(echo "$assigned_to" | sed -E 's/\s+(sorted|order|limit|since|from|with|and|or|in|on|by|the)(\s.*)?$//')
+    assigned_to=$(echo "$assigned_to" | sed 's/[[:space:]]*$//')
+    if [[ -n "$assigned_to" ]]; then
+      query_parts+=("assigned_to.name=${assigned_to}")
+    fi
+  fi
+
+  # "assignment group <group>" or "assign to <group> team/group"
+  if [[ "$input" =~ ([Aa]ssignment[[:space:]]+[Gg]roup|[Aa]ssign[[:space:]]+[Tt]o[[:space:]]+[Gg]roup|[Tt]eam)[[:space:]]+([a-zA-Z][a-zA-Z[:space:]]+) ]]; then
+    assignment_group="${BASH_REMATCH[2]}"
+    assignment_group=$(echo "$assignment_group" | sed -E 's/\s+(sorted|order|limit|since|from|with|and|or|in|on|by|the)(\s.*)?$//')
+    assignment_group=$(echo "$assignment_group" | sed 's/[[:space:]]*$//')
+  fi
+
+  # Check for patterns like "assigned to Network team" or "assigned to <X>"
+  if [[ -z "$assignment_group" ]] && [[ "$input" =~ [Aa]ssigned[[:space:]]+[Tt]o[[:space:]]+(.+?)[[:space:]]+(team|group|Team|Group) ]]; then
+    assignment_group="${BASH_REMATCH[1]}"
+  fi
+
+  # "assign to <Name>" (without team/group suffix — common in create requests)
+  # Use original input (not lowered) to preserve case of group/person names
+  if [[ -z "$assignment_group" ]] && [[ "$input" =~ [Aa]ssign[[:space:]]+[Tt]o[[:space:]]+([A-Za-z][A-Za-z[:space:]]+) ]]; then
+    assignment_group="${BASH_REMATCH[1]}"
+    assignment_group=$(echo "$assignment_group" | sed -E 's/\s+(sorted|order|limit|since|from|with|and|or|in|on|by|the)(\s.*)?$//')
+    assignment_group=$(echo "$assignment_group" | sed 's/[[:space:]]*$//')
+    # If we also parsed this as "assigned_to", prefer assignment_group
+    local new_parts2=()
+    for part in "${query_parts[@]}"; do
+      if [[ "$part" != assigned_to.name=* ]]; then
+        new_parts2+=("$part")
+      fi
+    done
+    query_parts=("${new_parts2[@]}")
+  fi
+
+  # Simpler pattern: "<table> for <group>" might refer to assignment group
+  if [[ -z "$assignment_group" ]] && echo "$lower" | grep -qP '\b(for|from)\s+\w+\s+(team|group)\b'; then
+    assignment_group=$(echo "$lower" | grep -oP '(?:for|from)\s+\K\w[\w\s]+?(?=\s+(?:team|group))' | head -1)
+  fi
+
+  if [[ -n "$assignment_group" ]]; then
+    # Remove "assigned_to" part if we also found an assignment_group
+    local new_parts=()
+    for part in "${query_parts[@]}"; do
+      if [[ "$part" != assigned_to.name=* ]]; then
+        new_parts+=("$part")
+      fi
+    done
+    query_parts=("${new_parts[@]}")
+    query_parts+=("assignment_group.name=${assignment_group}")
+  fi
+
+  # ── Parse category ────────────────────────────────────────────────
+  if [[ "$lower" =~ category[[:space:]]+([\"\']?)([a-zA-Z][a-zA-Z[:space:]]+)\1 ]]; then
+    local cat_val="${BASH_REMATCH[2]}"
+    cat_val=$(echo "$cat_val" | sed -E 's/\s+(sorted|order|limit|since|from|with|and|or|in|on|by|the)(\s.*)?$//')
+    query_parts+=("category=${cat_val}")
+  fi
+
+  # ── Parse short_description LIKE ──────────────────────────────────
+  if [[ "$lower" =~ (about|containing|contains|like|matching|regarding|related[[:space:]]+to|for)[[:space:]]+([\"\']?)([a-zA-Z][a-zA-Z[:space:]]+)\2 ]]; then
+    local desc_match="${BASH_REMATCH[3]}"
+    desc_match=$(echo "$desc_match" | sed -E 's/\s+(sorted|order|limit|since|from|with|and|or|in|on|by|the)(\s.*)?$//')
+    # Only add if it doesn't look like an already-parsed concept
+    if [[ ! "$desc_match" =~ ^(group|team|network|p[1-5]|open|closed|resolved|active)$ ]]; then
+      query_parts+=("short_descriptionLIKE${desc_match}")
+    fi
+  fi
+
+  # ── Parse specific record reference ──────────────────────────────
+  local ref_number=""
+  if [[ "$lower" =~ (inc|chg|prb|ritm|req|task|kb)[0-9]{7,10} ]]; then
+    ref_number=$(echo "$lower" | grep -oiP '(INC|CHG|PRB|RITM|REQ|TASK|KB)[0-9]{7,10}' | head -1 | tr '[:lower:]' '[:upper:]')
+  fi
+
+  # If we found a record number, add it to query
+  if [[ -n "$ref_number" ]]; then
+    query_parts+=("number=${ref_number}")
+    # Also infer table from prefix if not already resolved
+    if [[ -z "$resolved_table" ]]; then
+      case "${ref_number:0:3}" in
+        INC) resolved_table="incident" ;;
+        CHG) resolved_table="change_request" ;;
+        PRB) resolved_table="problem" ;;
+        RIT) resolved_table="sc_req_item" ;;
+        REQ) resolved_table="sc_request" ;;
+        TAS) resolved_table="task" ;;
+        KB0) resolved_table="kb_knowledge" ;;
+      esac
+    fi
+  fi
+
+  # ── Parse date/time filters ──────────────────────────────────────
+  if echo "$lower" | grep -qP 'last\s+(24\s+hours?|day)'; then
+    query_parts+=("sys_created_on>=javascript:gs.hoursAgo(24)")
+  elif echo "$lower" | grep -qP 'last\s+week|past\s+week'; then
+    query_parts+=("sys_created_on>=javascript:gs.daysAgo(7)")
+  elif echo "$lower" | grep -qP 'last\s+month|past\s+month'; then
+    query_parts+=("sys_created_on>=javascript:gs.daysAgo(30)")
+  elif echo "$lower" | grep -qP 'today'; then
+    query_parts+=("sys_created_on>=javascript:gs.daysAgo(0)")
+  elif echo "$lower" | grep -qP 'yesterday'; then
+    query_parts+=("sys_created_on>=javascript:gs.daysAgo(1)^sys_created_on<javascript:gs.daysAgo(0)")
+  elif echo "$lower" | grep -qP 'this\s+year'; then
+    query_parts+=("sys_created_on>=javascript:gs.beginningOfThisYear()")
+  fi
+
+  # ── Parse sort order ─────────────────────────────────────────────
+  local orderby=""
+  if echo "$lower" | grep -qP 'sort(ed)?\s+by\s+created|order\s+by\s+created|oldest\s+first'; then
+    orderby="sys_created_on"
+  elif echo "$lower" | grep -qP 'sort(ed)?\s+by\s+updated|order\s+by\s+updated|recently\s+updated'; then
+    orderby="-sys_updated_on"
+  elif echo "$lower" | grep -qP 'sort(ed)?\s+by\s+priority|order\s+by\s+priority|highest\s+priority'; then
+    orderby="priority"
+  elif echo "$lower" | grep -qP 'newest\s+first|most\s+recent|latest'; then
+    orderby="-sys_created_on"
+  elif echo "$lower" | grep -qP 'sort(ed)?\s+by\s+number|order\s+by\s+number'; then
+    orderby="number"
+  fi
+  # Check for descending
+  if echo "$lower" | grep -qP 'desc(ending)?'; then
+    [[ -n "$orderby" && "$orderby" != -* ]] && orderby="-${orderby}"
+  fi
+
+  # ── Parse limit ──────────────────────────────────────────────────
+  local limit="20"
+  if [[ "$lower" =~ (top|first|limit|show)\s+([0-9]+) ]]; then
+    limit="${BASH_REMATCH[2]}"
+  elif echo "$lower" | grep -qP '\ball\b'; then
+    limit="100"
+  fi
+
+  # ── Build the encoded query ──────────────────────────────────────
+  local encoded_query=""
+  if [[ ${#query_parts[@]} -gt 0 ]]; then
+    encoded_query=$(IFS='^'; echo "${query_parts[*]}")
+  fi
+
+  # ── Default table if still unknown ────────────────────────────────
+  if [[ -z "$resolved_table" ]]; then
+    # Default to incident for common ITSM queries
+    if echo "$lower" | grep -qP '(ticket|issue|outage|down|broke|fix|urgent|critical)'; then
+      resolved_table="incident"
+    else
+      echo "⚠️  Could not determine target table from input."
+      echo "Hint: Mention a table name like 'incidents', 'changes', 'users', 'servers', etc."
+      echo ""
+      echo "Available table aliases:"
+      echo "  ITSM:    incidents, changes, problems, tasks, requests, ritms"
+      echo "  Users:   users, groups, teams"
+      echo "  CMDB:    servers, computers, databases, applications, services, cis"
+      echo "  Other:   knowledge/articles, catalog items, alerts, slas, notifications"
+      return 1
+    fi
+  fi
+
+  # ── Build and output the command ──────────────────────────────────
+  local script_dir
+  script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  local cmd_str=""
+  local is_write=false
+
+  case "$intent" in
+    SCHEMA)
+      cmd_str="bash ${script_dir}/sn.sh schema ${resolved_table}"
+      echo "Intent:  SCHEMA"
+      echo "Table:   ${resolved_table}"
+      echo "Command: ${cmd_str}"
+      echo ""
+      # Schema is read-only, always execute
+      echo "Executing..."
+      echo ""
+      eval "$cmd_str"
+      ;;
+
+    AGGREGATE)
+      local agg_type="COUNT"
+      local agg_field=""
+      # Detect specific agg types
+      if echo "$lower" | grep -qP '\b(average|avg)\b'; then
+        agg_type="AVG"
+        agg_field=$(echo "$lower" | grep -oP '(?:average|avg)\s+(?:of\s+)?(\w+)' | awk '{print $NF}')
+      elif echo "$lower" | grep -qP '\bsum\b'; then
+        agg_type="SUM"
+        agg_field=$(echo "$lower" | grep -oP '(?:sum)\s+(?:of\s+)?(\w+)' | awk '{print $NF}')
+      elif echo "$lower" | grep -qP '\bmin(imum)?\b'; then
+        agg_type="MIN"
+        agg_field=$(echo "$lower" | grep -oP '(?:min(?:imum)?)\s+(?:of\s+)?(\w+)' | awk '{print $NF}')
+      elif echo "$lower" | grep -qP '\bmax(imum)?\b'; then
+        agg_type="MAX"
+        agg_field=$(echo "$lower" | grep -oP '(?:max(?:imum)?)\s+(?:of\s+)?(\w+)' | awk '{print $NF}')
+      fi
+
+      # Detect group-by
+      local group_by=""
+      if [[ "$lower" =~ (group(ed)?|by)\s+(priority|state|category|assigned_to|assignment_group|urgency|impact) ]]; then
+        group_by="${BASH_REMATCH[3]}"
+      fi
+
+      cmd_str="bash ${script_dir}/sn.sh aggregate ${resolved_table} --type ${agg_type}"
+      [[ -n "$encoded_query" ]] && cmd_str+=" --query \"${encoded_query}\""
+      [[ -n "$agg_field" ]]     && cmd_str+=" --field ${agg_field}"
+      [[ -n "$group_by" ]]      && cmd_str+=" --group-by ${group_by}"
+
+      echo "Intent:  AGGREGATE (${agg_type})"
+      echo "Table:   ${resolved_table}"
+      [[ -n "$encoded_query" ]] && echo "Query:   ${encoded_query}"
+      [[ -n "$group_by" ]]      && echo "Group:   ${group_by}"
+      echo "Command: ${cmd_str}"
+      echo ""
+      # Aggregates are read-only, always execute
+      echo "Executing..."
+      echo ""
+      eval "$cmd_str"
+      ;;
+
+    QUERY)
+      # Choose default fields based on table
+      local default_fields=""
+      case "$resolved_table" in
+        incident)        default_fields="number,short_description,state,priority,assigned_to,assignment_group,opened_at" ;;
+        change_request)  default_fields="number,short_description,state,priority,assigned_to,start_date,end_date" ;;
+        problem)         default_fields="number,short_description,state,priority,assigned_to,opened_at" ;;
+        sc_req_item)     default_fields="number,short_description,state,assigned_to,request,opened_at" ;;
+        sc_request)      default_fields="number,short_description,state,requested_for,opened_at" ;;
+        sys_user)        default_fields="user_name,name,email,department,active" ;;
+        sys_user_group)  default_fields="name,description,manager,active" ;;
+        cmdb_ci_server)  default_fields="name,ip_address,os,classification,operational_status" ;;
+        cmdb_ci)         default_fields="name,sys_class_name,operational_status,owned_by" ;;
+        kb_knowledge)    default_fields="number,short_description,workflow_state,author,published" ;;
+        task)            default_fields="number,short_description,state,assigned_to,sys_class_name,opened_at" ;;
+        *)               default_fields="" ;;
+      esac
+
+      cmd_str="bash ${script_dir}/sn.sh query ${resolved_table}"
+      [[ -n "$encoded_query" ]] && cmd_str+=" --query \"${encoded_query}\""
+      [[ -n "$default_fields" ]] && cmd_str+=" --fields ${default_fields}"
+      cmd_str+=" --limit ${limit}"
+      [[ -n "$orderby" ]] && cmd_str+=" --orderby ${orderby}"
+      cmd_str+=" --display true"
+
+      echo "Intent:  QUERY"
+      echo "Table:   ${resolved_table}"
+      [[ -n "$encoded_query" ]] && echo "Query:   ${encoded_query}"
+      [[ -n "$orderby" ]]       && echo "Sort:    ${orderby}"
+      echo "Limit:   ${limit}"
+      echo "Command: ${cmd_str}"
+      echo ""
+      # Queries are read-only, always execute
+      echo "Executing..."
+      echo ""
+      eval "$cmd_str"
+      ;;
+
+    CREATE)
+      is_write=true
+      # Parse fields from natural language for create
+      local payload='{}'
+
+      # Extract short description - text after "for" or main subject
+      local short_desc=""
+      if [[ "$lower" =~ (for|about|regarding)[[:space:]]+([^,]+) ]]; then
+        short_desc="${BASH_REMATCH[2]}"
+        short_desc=$(echo "$short_desc" | sed -E 's/\s*(,|assign|priority|p[1-5]|urgency|impact|category).*$//')
+        short_desc=$(echo "$short_desc" | sed 's/[[:space:]]*$//')
+      fi
+      [[ -n "$short_desc" ]] && payload=$(echo "$payload" | jq --arg v "$short_desc" '. + {short_description: $v}')
+
+      # Add priority from parsed query parts
+      for part in "${query_parts[@]}"; do
+        if [[ "$part" == priority=* ]]; then
+          local pval="${part#priority=}"
+          payload=$(echo "$payload" | jq --arg v "$pval" '. + {priority: $v}')
+        fi
+      done
+
+      # Add urgency
+      if echo "$lower" | grep -qP 'urgency\s+(1|2|3|high|medium|low)'; then
+        local urg
+        urg=$(echo "$lower" | grep -oP 'urgency\s+\K(1|2|3|high|medium|low)')
+        case "$urg" in
+          high) urg="1" ;; medium) urg="2" ;; low) urg="3" ;;
+        esac
+        payload=$(echo "$payload" | jq --arg v "$urg" '. + {urgency: $v}')
+      fi
+
+      # Add impact
+      if echo "$lower" | grep -qP 'impact\s+(1|2|3|high|medium|low)'; then
+        local imp
+        imp=$(echo "$lower" | grep -oP 'impact\s+\K(1|2|3|high|medium|low)')
+        case "$imp" in
+          high) imp="1" ;; medium) imp="2" ;; low) imp="3" ;;
+        esac
+        payload=$(echo "$payload" | jq --arg v "$imp" '. + {impact: $v}')
+      fi
+
+      # Add assignment group if found
+      [[ -n "$assignment_group" ]] && payload=$(echo "$payload" | jq --arg v "$assignment_group" '. + {assignment_group: $v}')
+
+      local payload_str
+      payload_str=$(echo "$payload" | jq -c .)
+
+      cmd_str="bash ${script_dir}/sn.sh create ${resolved_table} '${payload_str}'"
+
+      echo "Intent:  CREATE"
+      echo "Table:   ${resolved_table}"
+      echo "Payload: ${payload_str}"
+      echo "Command: ${cmd_str}"
+      echo ""
+
+      if [[ "$execute" == "true" ]]; then
+        echo "Executing..."
+        echo ""
+        bash "${script_dir}/sn.sh" create "${resolved_table}" "${payload_str}"
+      else
+        echo "⚠️  This is a WRITE operation. Add --execute to run it."
+      fi
+      ;;
+
+    UPDATE)
+      is_write=true
+      local update_payload='{}'
+      local target_id=""
+
+      # Try to get sys_id or record number from input
+      if [[ -n "$ref_number" ]]; then
+        target_id="$ref_number"
+      fi
+
+      # Parse "set <field> to <value>" patterns
+      if [[ "$lower" =~ set[[:space:]]+([a-z_]+)[[:space:]]+to[[:space:]]+([^,]+) ]]; then
+        local uf="${BASH_REMATCH[1]}"
+        local uv="${BASH_REMATCH[2]}"
+        uv=$(echo "$uv" | sed 's/[[:space:]]*$//')
+        update_payload=$(echo "$update_payload" | jq --arg k "$uf" --arg v "$uv" '. + {($k): $v}')
+      fi
+
+      # Parse state changes
+      if echo "$lower" | grep -qP '\bclose\b|\bresolve\b'; then
+        if echo "$lower" | grep -qP '\bresolve\b'; then
+          update_payload=$(echo "$update_payload" | jq '. + {state: "6"}')
+        else
+          update_payload=$(echo "$update_payload" | jq '. + {state: "7"}')
+        fi
+      fi
+
+      # Parse priority changes
+      for part in "${query_parts[@]}"; do
+        if [[ "$part" == priority=* ]]; then
+          local pval="${part#priority=}"
+          update_payload=$(echo "$update_payload" | jq --arg v "$pval" '. + {priority: $v}')
+        fi
+      done
+
+      local update_str
+      update_str=$(echo "$update_payload" | jq -c .)
+
+      if [[ -n "$target_id" ]]; then
+        cmd_str="bash ${script_dir}/sn.sh update ${resolved_table} <sys_id_of_${target_id}> '${update_str}'"
+        echo "Intent:  UPDATE"
+        echo "Table:   ${resolved_table}"
+        echo "Target:  ${target_id} (resolve sys_id first with: bash ${script_dir}/sn.sh query ${resolved_table} --query \"number=${target_id}\" --fields sys_id)"
+        echo "Payload: ${update_str}"
+        echo "Command: ${cmd_str}"
+      else
+        cmd_str="bash ${script_dir}/sn.sh update ${resolved_table} <sys_id> '${update_str}'"
+        echo "Intent:  UPDATE"
+        echo "Table:   ${resolved_table}"
+        echo "Payload: ${update_str}"
+        echo "Command: ${cmd_str}"
+        echo "Note:    Provide a record number or sys_id to target"
+      fi
+      echo ""
+
+      if [[ "$execute" == "true" ]]; then
+        echo "⚠️  Cannot auto-execute update without a resolved sys_id."
+        echo "    Use sn.sh update <table> <sys_id> '<json>' directly."
+      else
+        echo "⚠️  This is a WRITE operation. Add --execute to run it."
+      fi
+      ;;
+
+    BATCH)
+      is_write=true
+      local batch_action="update"
+      echo "$lower" | grep -qP '\bdelete\b|\bremove\b' && batch_action="delete"
+
+      local batch_fields=""
+      if [[ "$batch_action" == "update" ]]; then
+        # Look for close/resolve action
+        if echo "$lower" | grep -qP '\bclose\b'; then
+          batch_fields='{"state":"7","close_code":"Solved (Permanently)","close_notes":"Bulk closed via sn_nl"}'
+        elif echo "$lower" | grep -qP '\bresolve\b'; then
+          batch_fields='{"state":"6"}'
+        fi
+      fi
+
+      cmd_str="bash ${script_dir}/sn.sh batch ${resolved_table} --action ${batch_action}"
+      [[ -n "$encoded_query" ]] && cmd_str+=" --query \"${encoded_query}\""
+      [[ -n "$batch_fields" ]]  && cmd_str+=" --fields '${batch_fields}'"
+      cmd_str+=" --limit ${limit}"
+
+      echo "Intent:  BATCH ${batch_action^^}"
+      echo "Table:   ${resolved_table}"
+      [[ -n "$encoded_query" ]] && echo "Query:   ${encoded_query}"
+      [[ -n "$batch_fields" ]]  && echo "Fields:  ${batch_fields}"
+      echo "Limit:   ${limit}"
+      echo "Command: ${cmd_str}"
+      echo ""
+
+      if [[ "$execute" == "true" && "$confirm" == "true" ]]; then
+        if [[ "$batch_action" == "delete" && "$force" != "true" ]]; then
+          echo "⚠️  Bulk DELETE requires --confirm --force. This is a safety measure."
+        else
+          echo "Executing..."
+          echo ""
+          local exec_cmd="bash ${script_dir}/sn.sh batch ${resolved_table} --action ${batch_action}"
+          [[ -n "$encoded_query" ]] && exec_cmd+=" --query \"${encoded_query}\""
+          [[ -n "$batch_fields" ]]  && exec_cmd+=" --fields '${batch_fields}'"
+          exec_cmd+=" --limit ${limit} --confirm"
+          eval "$exec_cmd"
+        fi
+      else
+        echo "⚠️  This is a BULK WRITE operation."
+        echo "    Add --execute --confirm to run it."
+        [[ "$batch_action" == "delete" ]] && echo "    Bulk deletes also require --force."
+      fi
+      ;;
+
+    DELETE)
+      is_write=true
+      local del_target=""
+      [[ -n "$ref_number" ]] && del_target="$ref_number"
+
+      if [[ -n "$del_target" ]]; then
+        cmd_str="bash ${script_dir}/sn.sh delete ${resolved_table} <sys_id_of_${del_target}> --confirm"
+        echo "Intent:  DELETE"
+        echo "Table:   ${resolved_table}"
+        echo "Target:  ${del_target} (resolve sys_id first)"
+        echo "Command: ${cmd_str}"
+      else
+        cmd_str="bash ${script_dir}/sn.sh delete ${resolved_table} <sys_id> --confirm"
+        echo "Intent:  DELETE"
+        echo "Table:   ${resolved_table}"
+        echo "Command: ${cmd_str}"
+        echo "Note:    Provide a record number or sys_id to target"
+      fi
+      echo ""
+      echo "⚠️  This is a DELETE operation. Use sn.sh delete directly with --confirm."
+      ;;
+  esac
+}
+
 # ── Main dispatcher ────────────────────────────────────────────────────
-cmd="${1:?Usage: sn.sh <query|get|create|update|delete|aggregate|schema|attach|batch|health> ...}"
+cmd="${1:?Usage: sn.sh <query|get|create|update|delete|aggregate|schema|attach|batch|health|nl> ...}"
 shift
 
 case "$cmd" in
@@ -571,5 +1263,6 @@ case "$cmd" in
   attach)    cmd_attach "$@" ;;
   batch)     cmd_batch "$@" ;;
   health)    cmd_health "$@" ;;
+  nl)        cmd_nl "$@" ;;
   *)         die "Unknown command: $cmd" ;;
 esac
