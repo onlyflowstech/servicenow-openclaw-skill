@@ -29,6 +29,8 @@ Whether you're triaging incidents at 2 AM, auditing CMDB accuracy, or building c
 | **sn_aggregate** | Run COUNT, AVG, MIN, MAX, SUM with group-by support |
 | **sn_schema** | Introspect table schemas — field types, lengths, references, mandatory flags |
 | **sn_attach** | List, upload, and download file attachments on any record |
+| **sn_batch** | Bulk update or delete records with dry-run safety, query filters, and progress tracking |
+| **sn_health** | Instance health dashboard — version, cluster nodes, stuck jobs, semaphores, and quick stats |
 
 ---
 
@@ -101,6 +103,20 @@ Once configured, just ask your agent in natural language:
 ### Knowledge Management
 > **"Find knowledge articles about password resets"**
 > → Searches `kb_knowledge` with description LIKE filters
+
+### Bulk Operations
+> **"Close all resolved incidents older than 90 days"**
+> → Runs `sn_batch` on `incident` with state/date filters and update action
+
+> **"How many abandoned test records do we have?"**
+> → Dry-run batch delete to count matching records without changes
+
+### Instance Health
+> **"Is the instance healthy?"**
+> → Runs `sn_health` with all checks — version, nodes, stuck jobs, semaphores, and stats
+
+> **"Any stuck scheduled jobs?"**
+> → Runs `sn_health --check jobs` to find overdue sys_trigger records
 
 ---
 
@@ -187,5 +203,4 @@ Contributions welcome! Open an issue or PR at [github.com/onlyflowstech/servicen
 Ideas for contribution:
 - Additional ServiceNow API support (CMDB API, Import Sets, Scripted REST)
 - OAuth 2.0 authentication
-- Batch operations
 - ServiceNow Flow Designer integration
