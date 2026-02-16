@@ -1250,7 +1250,8 @@ cmd_nl() {
 
 # ── relationships ───────────────────────────────────────────────────────
 cmd_relationships() {
-  local ci_name="" opt_sys_id="" depth=1 rel_type="" ci_class="" direction="both"
+  local default_depth="${SN_REL_DEPTH:-3}"
+  local ci_name="" opt_sys_id="" depth="$default_depth" rel_type="" ci_class="" direction="both"
   local impact=false json_output=false
 
   # Parse arguments
