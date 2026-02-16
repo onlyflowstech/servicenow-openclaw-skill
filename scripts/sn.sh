@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
+# ──────────────────────────────────────────────────────────────────────
 # ServiceNow Table API CLI — sn.sh
+# The first ServiceNow skill for OpenClaw
+#
+# Author:  Brandon Wilson — ServiceNow Certified Technical Architect (CTA)
+# Company: OnlyFlows (https://onlyflows.tech)
+# GitHub:  https://github.com/onlyflowstech/servicenow-openclaw-skill
+# License: MIT
+# ──────────────────────────────────────────────────────────────────────
 # Usage: bash sn.sh <command> [args...]
 # Commands: query, get, create, update, delete, aggregate, schema, attach
 set -euo pipefail
