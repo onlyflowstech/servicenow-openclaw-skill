@@ -1587,6 +1587,9 @@ cmd_relationships() {
 }
 
 # ── script ─────────────────────────────────────────────────────────────
+# Executes a background script on ServiceNow via sys.scripts.do
+# This uses a session-based approach (login → get CSRF token → POST script)
+# because ServiceNow does NOT expose a REST API for background scripts.
 cmd_script() {
   local script_code="" script_file="" timeout=30 scope="global" confirm=false
   local MAX_TIMEOUT=300
@@ -1666,161 +1669,43 @@ cmd_script() {
   echo "   Scope: ${scope} | Timeout: ${timeout}s | Size: ${script_size} bytes | Hash: ${script_hash}" >&2
   echo "" >&2
 
-  info "POST background script (hash=${script_hash}, scope=${scope})"
+  info "Executing background script via Playwright (hash=${script_hash}, scope=${scope})"
 
-  # ── Build request body ──────────────────────────────────────────
-  local body
-  body=$(jq -n --arg s "$script_code" '{"script": $s}')
+  # ── Resolve the Playwright runner script path ───────────────────
+  local SKILL_DIR RUNNER_SCRIPT SCRIPT_TMPFILE
+  SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  RUNNER_SCRIPT="${SKILL_DIR}/scripts/sn_script_runner.js"
 
-  # ── Try primary endpoint: /api/now/sys/script/background ────────
-  local url="${SN_INSTANCE}/api/now/sys/script/background"
-  local resp http_code
-
-  # Add scope header if not global
-  local scope_header=()
-  if [[ "$scope" != "global" ]]; then
-    scope_header=(-H "X-App-Scope: ${scope}")
+  if [[ ! -f "$RUNNER_SCRIPT" ]]; then
+    die "Playwright runner not found: $RUNNER_SCRIPT"
   fi
 
-  # Use curl with full error handling (not sn_curl, we need http_code)
-  resp=$(curl -s -w "\n%{http_code}" -X POST "$url" \
-    -u "$AUTH" \
-    -H "Accept: application/json" \
-    -H "Content-Type: application/json" \
-    "${scope_header[@]}" \
-    --max-time "$timeout" \
-    -d "$body" 2>&1) || {
-    local curl_exit=$?
-    if [[ $curl_exit -eq 28 ]]; then
-      die "Script execution timed out after ${timeout}s"
-    else
-      die "curl failed with exit code $curl_exit"
-    fi
-  }
+  # Write script code to a temp file (avoids env var size/escaping issues)
+  SCRIPT_TMPFILE=$(mktemp /tmp/sn_script.XXXXXX.js)
+  trap "rm -f '${SCRIPT_TMPFILE}'" EXIT
+  printf '%s' "$script_code" > "$SCRIPT_TMPFILE"
 
-  http_code=$(echo "$resp" | tail -1)
-  local resp_body
-  resp_body=$(echo "$resp" | sed '$d')
+  # Convert timeout from seconds to milliseconds for the Playwright runner
+  local timeout_ms=$(( timeout * 1000 ))
 
-  # ── If primary endpoint fails, try fallbacks ─────────────────────
-  # 400 = "URI does not represent any resource", 404/405 = not found/not allowed
-  if [[ "$http_code" == "400" || "$http_code" == "404" || "$http_code" == "405" ]]; then
-    info "Primary endpoint not available (HTTP $http_code), trying fallback..."
+  # ── Run the Playwright script runner ────────────────────────────
+  # stdout from node → captured in $output
+  # stderr from node → flows through to our stderr
+  local output="" runner_exit=0
+  output=$(SN_INSTANCE="${SN_INSTANCE}" \
+    SN_USER="${SN_USER}" \
+    SN_PASSWORD="${SN_PASSWORD}" \
+    SN_SCRIPT_FILE="${SCRIPT_TMPFILE}" \
+    SN_TIMEOUT="${timeout_ms}" \
+    SN_SCOPE="${scope}" \
+    node "$RUNNER_SCRIPT") || runner_exit=$?
 
-    # Fallback 1: /api/sn_script/run (Scripted REST API)
-    url="${SN_INSTANCE}/api/sn_script/run"
-    resp=$(curl -s -w "\n%{http_code}" -X POST "$url" \
-      -u "$AUTH" \
-      -H "Accept: application/json" \
-      -H "Content-Type: application/json" \
-      "${scope_header[@]}" \
-      --max-time "$timeout" \
-      -d "$body" 2>&1) || {
-      local curl_exit=$?
-      if [[ $curl_exit -eq 28 ]]; then
-        die "Script execution timed out after ${timeout}s"
-      else
-        die "curl failed with exit code $curl_exit"
-      fi
-    }
+  # Clean up temp file
+  rm -f "$SCRIPT_TMPFILE"
+  trap - EXIT
 
-    http_code=$(echo "$resp" | tail -1)
-    resp_body=$(echo "$resp" | sed '$d')
-  fi
-
-  if [[ "$http_code" == "400" || "$http_code" == "404" || "$http_code" == "405" ]]; then
-    info "Fallback 1 not available (HTTP $http_code), trying ScriptEvaluator endpoint..."
-
-    # Fallback 2: /api/now/script/evaluator (GlideScriptEvaluator)
-    url="${SN_INSTANCE}/api/now/script/evaluator"
-    resp=$(curl -s -w "\n%{http_code}" -X POST "$url" \
-      -u "$AUTH" \
-      -H "Accept: application/json" \
-      -H "Content-Type: application/json" \
-      "${scope_header[@]}" \
-      --max-time "$timeout" \
-      -d "$body" 2>&1) || {
-      local curl_exit=$?
-      if [[ $curl_exit -eq 28 ]]; then
-        die "Script execution timed out after ${timeout}s"
-      else
-        die "curl failed with exit code $curl_exit"
-      fi
-    }
-
-    http_code=$(echo "$resp" | tail -1)
-    resp_body=$(echo "$resp" | sed '$d')
-  fi
-
-  if [[ "$http_code" == "400" || "$http_code" == "404" || "$http_code" == "405" ]]; then
-    info "Fallback 2 not available (HTTP $http_code), trying sys_script_execution..."
-
-    # Fallback 3: /api/now/table/sys_script_execution (legacy)
-    url="${SN_INSTANCE}/api/now/table/sys_script_execution"
-    local legacy_body
-    legacy_body=$(jq -n --arg s "$script_code" --arg sc "$scope" \
-      '{"script": $s, "scope": $sc}')
-
-    resp=$(curl -s -w "\n%{http_code}" -X POST "$url" \
-      -u "$AUTH" \
-      -H "Accept: application/json" \
-      -H "Content-Type: application/json" \
-      --max-time "$timeout" \
-      -d "$legacy_body" 2>&1) || {
-      local curl_exit=$?
-      if [[ $curl_exit -eq 28 ]]; then
-        die "Script execution timed out after ${timeout}s"
-      else
-        die "curl failed with exit code $curl_exit"
-      fi
-    }
-
-    http_code=$(echo "$resp" | tail -1)
-    resp_body=$(echo "$resp" | sed '$d')
-  fi
-
-  # ── Handle HTTP errors ──────────────────────────────────────────
-  if [[ "$http_code" -ge 400 ]]; then
-    local error_msg
-    error_msg=$(echo "$resp_body" | jq -r '.error.message // .error // empty' 2>/dev/null)
-    local error_detail
-    error_detail=$(echo "$resp_body" | jq -r '.error.detail // empty' 2>/dev/null)
-
-    if [[ -n "$error_msg" ]]; then
-      echo "ERROR: HTTP $http_code — $error_msg" >&2
-      [[ -n "$error_detail" ]] && echo "Detail: $error_detail" >&2
-    else
-      echo "ERROR: HTTP $http_code" >&2
-      echo "$resp_body" >&2
-    fi
-    exit 1
-  fi
-
-  # ── Parse and display response ──────────────────────────────────
-  # Try to extract script output from various response formats
-  local output=""
-
-  # Format 1: {result: {output: "..."}}
-  output=$(echo "$resp_body" | jq -r '.result.output // empty' 2>/dev/null)
-
-  # Format 2: {result: "..."}  (direct string)
-  if [[ -z "$output" ]]; then
-    output=$(echo "$resp_body" | jq -r 'if .result | type == "string" then .result else empty end' 2>/dev/null)
-  fi
-
-  # Format 3: {result: {value: "..."}}
-  if [[ -z "$output" ]]; then
-    output=$(echo "$resp_body" | jq -r '.result.value // empty' 2>/dev/null)
-  fi
-
-  # Format 4: raw body is the output (some endpoints return plain text)
-  if [[ -z "$output" ]]; then
-    # Check if the response is valid JSON with a result
-    if echo "$resp_body" | jq -e '.result' >/dev/null 2>&1; then
-      output=$(echo "$resp_body" | jq -r '.result' 2>/dev/null)
-    else
-      output="$resp_body"
-    fi
+  if [[ $runner_exit -ne 0 ]]; then
+    die "Playwright script runner failed (exit $runner_exit)"
   fi
 
   # Build structured output
@@ -1831,11 +1716,9 @@ cmd_script() {
     --arg scope "$scope" \
     --arg instance "$SN_INSTANCE" \
     --arg output "$output" \
-    --argjson http "$http_code" \
     --argjson size "$script_size" \
     '{
       status: $status,
-      http_code: $http,
       script_hash: $hash,
       script_size_bytes: $size,
       scope: $scope,
@@ -1844,7 +1727,7 @@ cmd_script() {
     }')
 
   echo "$result" | jq .
-  info "Script executed successfully (hash=${script_hash}, HTTP ${http_code})"
+  info "Script executed successfully (hash=${script_hash})"
 }
 
 # ── syslog ─────────────────────────────────────────────────────────────
