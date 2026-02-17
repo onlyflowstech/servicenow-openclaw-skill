@@ -574,6 +574,136 @@ ServiceNow encoded queries use `^` as AND, `^OR` as OR:
 - `stateIN1,2,3` — State is 1, 2, or 3
 - `caller_id.name=John Smith` — Dot-walk through references
 
+### sn_atf — Automated Test Framework
+
+Find and run ATF tests and test suites.
+
+```bash
+bash scripts/sn.sh atf <list|suites|run|run-suite|results> [options]
+```
+
+**Subcommands:**
+
+#### `atf list` — List ATF tests
+
+```bash
+bash scripts/sn.sh atf list [--suite <name>] [--query <filter>] [--limit <N>] [--fields <fields>]
+```
+
+Options:
+- `--suite "<name>"` — Filter tests belonging to a specific suite (by name)
+- `--query "<encoded_query>"` — ServiceNow encoded query filter
+- `--limit <n>` — Max records (default 20)
+- `--fields "<field1,field2>"` — Fields to return (default: sys_id,name,description,active,sys_updated_on)
+
+Examples:
+
+```bash
+# List first 10 ATF tests
+bash scripts/sn.sh atf list --limit 10
+
+# Active tests only
+bash scripts/sn.sh atf list --query "active=true" --limit 20
+
+# Tests in a specific suite
+bash scripts/sn.sh atf list --suite "My Quick Start Tests"
+```
+
+#### `atf suites` — List ATF test suites
+
+```bash
+bash scripts/sn.sh atf suites [--query <filter>] [--limit <N>] [--fields <fields>]
+```
+
+Options:
+- `--query "<encoded_query>"` — ServiceNow encoded query filter
+- `--limit <n>` — Max records (default 20)
+- `--fields "<field1,field2>"` — Fields to return (default: sys_id,name,description,active)
+
+Examples:
+
+```bash
+# List all suites
+bash scripts/sn.sh atf suites --limit 50
+
+# Active suites only
+bash scripts/sn.sh atf suites --query "active=true"
+```
+
+#### `atf run` — Run a single ATF test
+
+```bash
+bash scripts/sn.sh atf run <test_sys_id> [--wait] [--no-wait] [--timeout <seconds>]
+```
+
+Executes a single ATF test by sys_id. Polls for completion by default.
+
+Options:
+- `--wait` — Poll until complete (default)
+- `--no-wait` — Trigger and return immediately
+- `--timeout <seconds>` — Max wait time (default 120)
+
+The command tries multiple API endpoints in order:
+1. `POST /api/sn_atf/rest/test` (scoped ATF API)
+2. `POST /api/now/atf/test/{sys_id}/run` (platform ATF API)
+3. Table API fallback (creates scheduled result record)
+
+Example:
+
+```bash
+bash scripts/sn.sh atf run abc123def456 --timeout 60
+```
+
+#### `atf run-suite` — Run an ATF test suite
+
+```bash
+bash scripts/sn.sh atf run-suite <suite_sys_id> [--wait] [--no-wait] [--timeout <seconds>]
+```
+
+Executes an entire ATF test suite. Returns a summary with pass/fail/skip counts.
+
+Options:
+- `--wait` — Poll until complete (default)
+- `--no-wait` — Trigger and return immediately
+- `--timeout <seconds>` — Max wait time (default 300)
+
+Output (JSON):
+```json
+{
+  "suite_sys_id": "abc123...",
+  "summary": {"total": 10, "passed": 8, "failed": 1, "skipped": 1},
+  "results": [...]
+}
+```
+
+Example:
+
+```bash
+bash scripts/sn.sh atf run-suite abc123def456 --timeout 180
+```
+
+#### `atf results` — Get test/suite execution results
+
+```bash
+bash scripts/sn.sh atf results <execution_id> [--fields <fields>] [--limit <N>]
+```
+
+Fetches results for a specific test execution or suite run.
+
+Options:
+- `--fields "<field1,field2>"` — Fields to return (default: sys_id,test,status,output,duration,start_time,end_time)
+- `--limit <n>` — Max results (default 50)
+
+Examples:
+
+```bash
+# Get a single test result
+bash scripts/sn.sh atf results abc123def456
+
+# Get all results for a suite execution
+bash scripts/sn.sh atf results suite_sys_id_here --limit 100
+```
+
 ## Notes
 
 - All API calls use Basic Auth via `SN_USER` / `SN_PASSWORD`

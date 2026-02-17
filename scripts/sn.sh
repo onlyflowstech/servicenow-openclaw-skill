@@ -2124,8 +2124,396 @@ cmd_discover() {
   esac
 }
 
+# ── atf (Automated Test Framework) ──────────────────────────────────────
+cmd_atf() {
+  local subcmd="${1:?Usage: sn.sh atf <list|suites|run|run-suite|results> ...}"
+  shift
+
+  case "$subcmd" in
+    # ── atf list — List ATF tests ────────────────────────────────────
+    list)
+      local query="" fields="sys_id,name,description,active,sys_updated_on" limit="20" suite=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --suite)  suite="$2";  shift 2 ;;
+          --query)  query="$2";  shift 2 ;;
+          --limit)  limit="$2";  shift 2 ;;
+          --fields) fields="$2"; shift 2 ;;
+          *) die "Unknown option: $1" ;;
+        esac
+      done
+
+      # If --suite given, resolve the suite sys_id by name and filter tests
+      if [[ -n "$suite" ]]; then
+        info "Resolving suite: $suite"
+        local suite_encoded
+        suite_encoded=$(jq -rn --arg v "name=$suite" '$v | @uri')
+        local suite_resp
+        suite_resp=$(sn_curl GET "${SN_INSTANCE}/api/now/table/sys_atf_test_suite?sysparm_query=${suite_encoded}&sysparm_fields=sys_id,name&sysparm_limit=1") \
+          || die "Failed to resolve suite: $suite"
+        local suite_id
+        suite_id=$(echo "$suite_resp" | jq -r '.result[0].sys_id // empty')
+        [[ -z "$suite_id" ]] && die "Suite not found: $suite"
+        info "Suite resolved: $suite_id"
+
+        # Query sys_atf_test_suite_test (M2M table) for test sys_ids in suite
+        local m2m_resp
+        m2m_resp=$(sn_curl GET "${SN_INSTANCE}/api/now/table/sys_atf_test_suite_test?sysparm_query=test_suite=${suite_id}&sysparm_fields=test&sysparm_limit=500") \
+          || die "Failed to query suite tests"
+        local test_ids
+        test_ids=$(echo "$m2m_resp" | jq -r '[.result[].test] | join(",")' 2>/dev/null)
+        if [[ -z "$test_ids" || "$test_ids" == "null" ]]; then
+          echo '{"record_count":0,"results":[]}'
+          info "No tests found in suite: $suite"
+          return 0
+        fi
+        # Build IN clause for test sys_ids
+        local suite_filter="sys_idIN${test_ids}"
+        if [[ -n "$query" ]]; then
+          query="${suite_filter}^${query}"
+        else
+          query="$suite_filter"
+        fi
+      fi
+
+      local url="${SN_INSTANCE}/api/now/table/sys_atf_test?sysparm_limit=${limit}&sysparm_fields=${fields}"
+      [[ -n "$query" ]] && url+="&sysparm_query=$(jq -rn --arg v "$query" '$v | @uri')"
+
+      info "GET sys_atf_test (limit=$limit)"
+      local resp
+      resp=$(sn_curl GET "$url") || die "API request failed"
+      local count
+      count=$(echo "$resp" | jq '.result | length')
+      echo "$resp" | jq '{record_count: (.result | length), results: .result}'
+      info "Returned $count test(s)"
+      ;;
+
+    # ── atf suites — List ATF test suites ────────────────────────────
+    suites)
+      local query="" fields="sys_id,name,description,active" limit="20"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --query)  query="$2";  shift 2 ;;
+          --limit)  limit="$2";  shift 2 ;;
+          --fields) fields="$2"; shift 2 ;;
+          *) die "Unknown option: $1" ;;
+        esac
+      done
+
+      local url="${SN_INSTANCE}/api/now/table/sys_atf_test_suite?sysparm_limit=${limit}&sysparm_fields=${fields}"
+      [[ -n "$query" ]] && url+="&sysparm_query=$(jq -rn --arg v "$query" '$v | @uri')"
+
+      info "GET sys_atf_test_suite (limit=$limit)"
+      local resp
+      resp=$(sn_curl GET "$url") || die "API request failed"
+      local count
+      count=$(echo "$resp" | jq '.result | length')
+      echo "$resp" | jq '{record_count: (.result | length), results: .result}'
+      info "Returned $count suite(s)"
+      ;;
+
+    # ── atf run — Run a single ATF test ──────────────────────────────
+    run)
+      local test_id="${1:?Usage: sn.sh atf run <test_sys_id> [--wait] [--timeout <seconds>]}"
+      shift
+      local wait=true timeout=120
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --wait)    wait=true;     shift ;;
+          --no-wait) wait=false;    shift ;;
+          --timeout) timeout="$2";  shift 2 ;;
+          *) die "Unknown option: $1" ;;
+        esac
+      done
+
+      info "Running ATF test: $test_id"
+
+      # Try the ATF REST API: POST /api/sn_atf/rest/test
+      local run_url="${SN_INSTANCE}/api/sn_atf/rest/test"
+      local run_resp http_code
+
+      http_code=$(curl -s -o /tmp/sn_atf_run_resp.json -w "%{http_code}" \
+        -X POST "$run_url" \
+        -u "$AUTH" \
+        -H "Accept: application/json" \
+        -H "Content-Type: application/json" \
+        -d "{\"test_id\":\"${test_id}\"}")
+
+      if [[ "$http_code" == "200" || "$http_code" == "201" ]]; then
+        run_resp=$(cat /tmp/sn_atf_run_resp.json)
+        info "Test execution triggered via sn_atf REST API"
+      else
+        # Fallback: try /api/now/atf/test/{sys_id}/run
+        info "sn_atf API returned HTTP $http_code, trying alternative endpoint..."
+        http_code=$(curl -s -o /tmp/sn_atf_run_resp.json -w "%{http_code}" \
+          -X POST "${SN_INSTANCE}/api/now/atf/test/${test_id}/run" \
+          -u "$AUTH" \
+          -H "Accept: application/json" \
+          -H "Content-Type: application/json")
+
+        if [[ "$http_code" == "200" || "$http_code" == "201" ]]; then
+          run_resp=$(cat /tmp/sn_atf_run_resp.json)
+          info "Test execution triggered via /api/now/atf"
+        else
+          # Fallback: schedule run by inserting into sys_atf_test_result
+          info "REST APIs not available (HTTP $http_code). Scheduling test run via Table API..."
+          local schedule_payload
+          schedule_payload=$(jq -n --arg tid "$test_id" '{test: $tid, status: "scheduled"}')
+          run_resp=$(sn_curl POST "${SN_INSTANCE}/api/now/table/sys_atf_test_result" -d "$schedule_payload" 2>/dev/null) || true
+
+          if [[ -z "$run_resp" ]]; then
+            cat /tmp/sn_atf_run_resp.json 2>/dev/null
+            die "All ATF execution methods failed. Ensure the ATF plugin is active and your user has atf_admin role."
+          fi
+          info "Test run scheduled via Table API"
+        fi
+      fi
+      rm -f /tmp/sn_atf_run_resp.json
+
+      # Extract result tracker (sys_id or tracker_id from response)
+      local result_id tracker_id
+      result_id=$(echo "$run_resp" | jq -r '.result.sys_id // .result.result_id // empty' 2>/dev/null)
+      tracker_id=$(echo "$run_resp" | jq -r '.result.tracker_id // .result.progress_id // empty' 2>/dev/null)
+
+      if [[ "$wait" != "true" ]]; then
+        echo "$run_resp" | jq '.'
+        [[ -n "$result_id" ]] && info "Result ID: $result_id"
+        [[ -n "$tracker_id" ]] && info "Tracker ID: $tracker_id"
+        info "Test triggered (not waiting for completion)"
+        return 0
+      fi
+
+      # Poll for completion
+      info "Waiting for test completion (timeout: ${timeout}s)..."
+      local elapsed=0 poll_interval=5
+      local status=""
+
+      while (( elapsed < timeout )); do
+        sleep "$poll_interval"
+        elapsed=$((elapsed + poll_interval))
+
+        # Try to poll result by result_id
+        if [[ -n "$result_id" ]]; then
+          local poll_resp
+          poll_resp=$(sn_curl GET "${SN_INSTANCE}/api/now/table/sys_atf_test_result/${result_id}?sysparm_fields=sys_id,test,status,output,duration,start_time,end_time&sysparm_display_value=true" 2>/dev/null) || true
+          status=$(echo "$poll_resp" | jq -r '.result.status // empty' 2>/dev/null)
+        elif [[ -n "$tracker_id" ]]; then
+          # Poll via tracker
+          local tracker_resp
+          tracker_resp=$(sn_curl GET "${SN_INSTANCE}/api/now/table/sys_execution_tracker/${tracker_id}?sysparm_fields=state,result,message&sysparm_display_value=true" 2>/dev/null) || true
+          local tracker_state
+          tracker_state=$(echo "$tracker_resp" | jq -r '.result.state // empty' 2>/dev/null)
+          if [[ "$tracker_state" == "Successful" || "$tracker_state" == "Failed" || "$tracker_state" == "Cancelled" ]]; then
+            status="complete"
+          fi
+        else
+          # Poll by test sys_id — find the most recent result
+          local poll_resp
+          poll_resp=$(sn_curl GET "${SN_INSTANCE}/api/now/table/sys_atf_test_result?sysparm_query=test=${test_id}^ORDERBYDESCsys_created_on&sysparm_fields=sys_id,test,status,output,duration,start_time,end_time&sysparm_display_value=true&sysparm_limit=1" 2>/dev/null) || true
+          status=$(echo "$poll_resp" | jq -r '.result[0].status // empty' 2>/dev/null)
+          result_id=$(echo "$poll_resp" | jq -r '.result[0].sys_id // empty' 2>/dev/null)
+        fi
+
+        # Check completion statuses
+        local status_lower
+        status_lower=$(echo "$status" | tr '[:upper:]' '[:lower:]')
+        if [[ "$status_lower" == "success" || "$status_lower" == "pass" || "$status_lower" == "passed" \
+            || "$status_lower" == "failure" || "$status_lower" == "fail" || "$status_lower" == "failed" \
+            || "$status_lower" == "error" || "$status_lower" == "complete" || "$status_lower" == "skipped" \
+            || "$status_lower" == "cancelled" ]]; then
+          info "Test completed: $status (${elapsed}s)"
+          break
+        fi
+
+        printf "." >&2
+      done
+      echo "" >&2
+
+      if (( elapsed >= timeout )); then
+        info "⚠️  Timeout reached (${timeout}s) — test may still be running"
+      fi
+
+      # Fetch final result
+      if [[ -n "$result_id" ]]; then
+        local final_resp
+        final_resp=$(sn_curl GET "${SN_INSTANCE}/api/now/table/sys_atf_test_result/${result_id}?sysparm_fields=sys_id,test,status,output,duration,start_time,end_time&sysparm_display_value=true" 2>/dev/null) || true
+        echo "$final_resp" | jq '.result'
+      else
+        echo "$run_resp" | jq '.'
+      fi
+      ;;
+
+    # ── atf run-suite — Run an ATF test suite ────────────────────────
+    run-suite)
+      local suite_id="${1:?Usage: sn.sh atf run-suite <suite_sys_id> [--wait] [--timeout <seconds>]}"
+      shift
+      local wait=true timeout=300
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --wait)    wait=true;     shift ;;
+          --no-wait) wait=false;    shift ;;
+          --timeout) timeout="$2";  shift 2 ;;
+          *) die "Unknown option: $1" ;;
+        esac
+      done
+
+      info "Running ATF test suite: $suite_id"
+
+      # Try the ATF REST API: POST /api/sn_atf/rest/suite
+      local run_url="${SN_INSTANCE}/api/sn_atf/rest/suite"
+      local run_resp http_code
+
+      http_code=$(curl -s -o /tmp/sn_atf_suite_resp.json -w "%{http_code}" \
+        -X POST "$run_url" \
+        -u "$AUTH" \
+        -H "Accept: application/json" \
+        -H "Content-Type: application/json" \
+        -d "{\"suite_id\":\"${suite_id}\"}")
+
+      if [[ "$http_code" == "200" || "$http_code" == "201" ]]; then
+        run_resp=$(cat /tmp/sn_atf_suite_resp.json)
+        info "Suite execution triggered via sn_atf REST API"
+      else
+        # Fallback: try /api/now/atf/suite/{sys_id}/run
+        info "sn_atf API returned HTTP $http_code, trying alternative endpoint..."
+        http_code=$(curl -s -o /tmp/sn_atf_suite_resp.json -w "%{http_code}" \
+          -X POST "${SN_INSTANCE}/api/now/atf/suite/${suite_id}/run" \
+          -u "$AUTH" \
+          -H "Accept: application/json" \
+          -H "Content-Type: application/json")
+
+        if [[ "$http_code" == "200" || "$http_code" == "201" ]]; then
+          run_resp=$(cat /tmp/sn_atf_suite_resp.json)
+          info "Suite execution triggered via /api/now/atf"
+        else
+          cat /tmp/sn_atf_suite_resp.json 2>/dev/null
+          die "Suite execution failed (HTTP $http_code). Ensure the ATF plugin is active and your user has atf_admin role."
+        fi
+      fi
+      rm -f /tmp/sn_atf_suite_resp.json
+
+      # Extract tracking info
+      local result_id tracker_id
+      result_id=$(echo "$run_resp" | jq -r '.result.sys_id // .result.result_id // empty' 2>/dev/null)
+      tracker_id=$(echo "$run_resp" | jq -r '.result.tracker_id // .result.progress_id // empty' 2>/dev/null)
+
+      if [[ "$wait" != "true" ]]; then
+        echo "$run_resp" | jq '.'
+        [[ -n "$result_id" ]] && info "Result ID: $result_id"
+        [[ -n "$tracker_id" ]] && info "Tracker ID: $tracker_id"
+        info "Suite triggered (not waiting for completion)"
+        return 0
+      fi
+
+      # Poll for completion
+      info "Waiting for suite completion (timeout: ${timeout}s)..."
+      local elapsed=0 poll_interval=5
+      local completed=false
+
+      while (( elapsed < timeout )); do
+        sleep "$poll_interval"
+        elapsed=$((elapsed + poll_interval))
+
+        if [[ -n "$tracker_id" ]]; then
+          local tracker_resp
+          tracker_resp=$(sn_curl GET "${SN_INSTANCE}/api/now/table/sys_execution_tracker/${tracker_id}?sysparm_fields=state,result,message,completion_percent&sysparm_display_value=true" 2>/dev/null) || true
+          local tracker_state
+          tracker_state=$(echo "$tracker_resp" | jq -r '.result.state // empty' 2>/dev/null)
+          local pct
+          pct=$(echo "$tracker_resp" | jq -r '.result.completion_percent // empty' 2>/dev/null)
+          [[ -n "$pct" ]] && printf "\r  Progress: %s%%" "$pct" >&2
+          if [[ "$tracker_state" == "Successful" || "$tracker_state" == "Failed" || "$tracker_state" == "Cancelled" ]]; then
+            completed=true
+            echo "" >&2
+            info "Suite completed: $tracker_state (${elapsed}s)"
+            break
+          fi
+        else
+          printf "." >&2
+        fi
+      done
+      [[ "$completed" != "true" ]] && echo "" >&2
+
+      if (( elapsed >= timeout )); then
+        info "⚠️  Timeout reached (${timeout}s) — suite may still be running"
+      fi
+
+      # Fetch suite results — query test results linked to this suite execution
+      local results_query="test_suite=${suite_id}^ORDERBYDESCsys_created_on"
+      local results_url="${SN_INSTANCE}/api/now/table/sys_atf_test_result?sysparm_query=$(jq -rn --arg v "$results_query" '$v | @uri')&sysparm_fields=sys_id,test,status,output,duration,start_time,end_time&sysparm_display_value=true&sysparm_limit=200"
+
+      local results_resp
+      results_resp=$(sn_curl GET "$results_url" 2>/dev/null) || true
+
+      local total_tests passed failed skipped
+      total_tests=$(echo "$results_resp" | jq '.result | length' 2>/dev/null || echo "0")
+      passed=$(echo "$results_resp" | jq '[.result[] | select(.status == "Success" or .status == "Pass" or .status == "Passed")] | length' 2>/dev/null || echo "0")
+      failed=$(echo "$results_resp" | jq '[.result[] | select(.status == "Failure" or .status == "Fail" or .status == "Failed" or .status == "Error")] | length' 2>/dev/null || echo "0")
+      skipped=$(echo "$results_resp" | jq '[.result[] | select(.status == "Skipped" or .status == "Cancelled")] | length' 2>/dev/null || echo "0")
+
+      # Build summary output
+      local summary
+      summary=$(jq -n \
+        --arg sid "$suite_id" \
+        --argjson total "$total_tests" \
+        --argjson pass "$passed" \
+        --argjson fail "$failed" \
+        --argjson skip "$skipped" \
+        '{suite_sys_id: $sid, summary: {total: $total, passed: $pass, failed: $fail, skipped: $skip}}')
+
+      # Append individual results
+      if [[ "$total_tests" -gt 0 ]]; then
+        summary=$(echo "$summary" | jq --argjson r "$(echo "$results_resp" | jq '.result')" '. + {results: $r}')
+      fi
+
+      echo "$summary" | jq '.'
+      info "Suite results: $passed passed, $failed failed, $skipped skipped (of $total_tests)"
+      ;;
+
+    # ── atf results — Get test/suite execution results ───────────────
+    results)
+      local execution_id="${1:?Usage: sn.sh atf results <execution_id> [--fields <fields>] [--limit <N>]}"
+      shift
+      local fields="sys_id,test,status,output,duration,start_time,end_time" limit="50"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --fields) fields="$2"; shift 2 ;;
+          --limit)  limit="$2";  shift 2 ;;
+          *) die "Unknown option: $1" ;;
+        esac
+      done
+
+      info "Fetching ATF results for: $execution_id"
+
+      # First try: direct get by sys_id (single test result)
+      local resp
+      resp=$(sn_curl GET "${SN_INSTANCE}/api/now/table/sys_atf_test_result/${execution_id}?sysparm_fields=${fields}&sysparm_display_value=true" 2>/dev/null) || true
+      local got_single
+      got_single=$(echo "$resp" | jq -r '.result.sys_id // empty' 2>/dev/null)
+
+      if [[ -n "$got_single" ]]; then
+        echo "$resp" | jq '.result'
+        info "Returned 1 result record"
+        return 0
+      fi
+
+      # Second try: query by execution_id or parent field
+      local query="execution=${execution_id}^ORparent=${execution_id}^ORtest_suite=${execution_id}"
+      local query_url="${SN_INSTANCE}/api/now/table/sys_atf_test_result?sysparm_query=$(jq -rn --arg v "$query" '$v | @uri')&sysparm_fields=${fields}&sysparm_display_value=true&sysparm_limit=${limit}"
+
+      resp=$(sn_curl GET "$query_url") || die "Failed to query results"
+      local count
+      count=$(echo "$resp" | jq '.result | length')
+      echo "$resp" | jq '{record_count: (.result | length), results: .result}'
+      info "Returned $count result(s)"
+      ;;
+
+    *) die "Unknown atf subcommand: $subcmd (use list, suites, run, run-suite, results)" ;;
+  esac
+}
+
 # ── Main dispatcher ────────────────────────────────────────────────────
-cmd="${1:?Usage: sn.sh <query|get|create|update|delete|aggregate|schema|attach|batch|health|nl|script|relationships|syslog|codesearch|discover> ...}"
+cmd="${1:?Usage: sn.sh <query|get|create|update|delete|aggregate|schema|attach|batch|health|nl|script|relationships|syslog|codesearch|discover|atf> ...}"
 shift
 
 case "$cmd" in
@@ -2145,5 +2533,6 @@ case "$cmd" in
   syslog)        cmd_syslog "$@" ;;
   codesearch)    cmd_codesearch "$@" ;;
   discover)      cmd_discover "$@" ;;
+  atf)           cmd_atf "$@" ;;
   *)             die "Unknown command: $cmd" ;;
 esac
