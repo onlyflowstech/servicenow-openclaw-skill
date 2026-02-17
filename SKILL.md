@@ -237,6 +237,70 @@ Output (JSON):
 }
 ```
 
+### sn_script — Execute Background Scripts
+
+```bash
+bash scripts/sn.sh script '<javascript code>' [options]
+```
+
+Executes a background script on the ServiceNow instance via the Background Script API. This runs server-side GlideRecord/GlideSystem JavaScript code and returns the output from `gs.print()` calls.
+
+**⚠️ Requires `admin` role on the target instance.**
+
+Options:
+- `'<code>'` — Inline JavaScript code (quoted)
+- `--file <path>` — Read script from a file instead of inline
+- `--timeout <seconds>` — Override curl timeout (default 30, max 300)
+- `--scope <app_scope>` — Run in a specific application scope (default: global)
+- `--confirm` — Required for scripts containing destructive keywords
+
+**Safety features:**
+- Prints a warning before executing that this runs server-side code
+- Requires `--confirm` for scripts containing: `deleteRecord`, `deleteMultiple`, `.delete()`, `GlideRecord.delete`, `setWorkflow(false)`
+- Maximum script size: 50KB
+- Default timeout: 30 seconds
+- Logs script hash (first 8 chars of SHA256) for audit trail
+
+**API endpoints (tried in order):**
+1. `POST /api/now/sys/script/background` (primary)
+2. `POST /api/sn_script/run` (fallback)
+3. `POST /api/now/table/sys_script_execution` (legacy)
+
+Examples:
+
+```bash
+# Simple query — count open incidents
+bash scripts/sn.sh script 'var gr = new GlideRecord("incident"); gr.addQuery("state", 1); gr.query(); gs.print("Open incidents: " + gr.getRowCount());'
+
+# Read script from a file
+bash scripts/sn.sh script --file /path/to/my_script.js
+
+# Run with extended timeout (long-running script)
+bash scripts/sn.sh script --timeout 120 'var gr = new GlideRecord("cmdb_ci"); gr.query(); while (gr.next()) { gs.print(gr.name); }'
+
+# Run in a specific application scope
+bash scripts/sn.sh script --scope x_myapp_custom 'gs.print(gs.getCurrentApplicationId());'
+
+# Destructive script (requires --confirm)
+bash scripts/sn.sh script --confirm 'var gr = new GlideRecord("u_test_table"); gr.addQuery("u_status", "abandoned"); gr.query(); while (gr.next()) { gr.deleteRecord(); }'
+
+# Complex multi-table query
+bash scripts/sn.sh script 'var gr = new GlideRecord("cmdb_rel_ci"); gr.addQuery("parent", "SYS_ID_HERE"); gr.query(); while (gr.next()) { gs.print(gr.type.name + " -> " + gr.child.name + " [" + gr.child.sys_class_name + "]"); }'
+```
+
+Output (JSON):
+```json
+{
+  "status": "success",
+  "http_code": 200,
+  "script_hash": "a1b2c3d4",
+  "script_size_bytes": 142,
+  "scope": "global",
+  "instance": "https://yourinstance.service-now.com",
+  "output": "Open incidents: 54"
+}
+```
+
 ### sn_nl — Natural Language Interface
 
 ```bash
@@ -334,6 +398,140 @@ Executing...
 [results]
 ```
 
+### sn_syslog — Query System Logs
+
+```bash
+bash scripts/sn.sh syslog [options]
+```
+
+Query the `syslog` table with log-specific defaults and filters. Results are ordered by newest first.
+
+Options:
+- `--level <error|warning|info|debug>` — Filter by severity level
+- `--source <source>` — Filter by source field (LIKE match)
+- `--message <text>` — Filter message contains text (LIKE match)
+- `--query <raw_query>` — Raw encoded query (overrides individual filters above)
+- `--limit <n>` — Max records (default 25)
+- `--since <minutes>` — Show logs from last N minutes (default 60)
+- `--fields <fields>` — Fields to return (default: sys_id,level,source,message,sys_created_on)
+
+Examples:
+
+```bash
+# Recent error logs
+bash scripts/sn.sh syslog --level error --limit 10
+
+# Logs from a specific source in the last 30 minutes
+bash scripts/sn.sh syslog --source "LDAP" --since 30
+
+# Search log messages for a keyword
+bash scripts/sn.sh syslog --message "timeout" --level warning
+
+# Combined filters
+bash scripts/sn.sh syslog --level error --source "REST" --since 120 --limit 50
+
+# Raw query override
+bash scripts/sn.sh syslog --query "level=error^sourceLIKEAuth" --limit 10
+```
+
+### sn_codesearch — Search Code Artifacts
+
+```bash
+bash scripts/sn.sh codesearch <search_term> [options]
+```
+
+Search across ServiceNow code artifacts (business rules, script includes, UI scripts, client scripts, scripted REST operations). Aggregates results from multiple tables showing table source, name, sys_id, and a code snippet.
+
+Options:
+- `--table <table>` — Search a specific table only (default: searches all code tables)
+- `--field <field>` — Specific field to search (default: script)
+- `--limit <n>` — Max total results (default 20)
+
+Default search targets:
+1. `sys_script` (Business Rules) — field: `script`
+2. `sys_script_include` (Script Includes) — field: `script`
+3. `sys_ui_script` (UI Scripts) — field: `script`
+4. `sys_script_client` (Client Scripts) — field: `script`
+5. `sys_ws_operation` (Scripted REST) — field: `operation_script`
+
+Examples:
+
+```bash
+# Search for GlideRecord usage across all code tables
+bash scripts/sn.sh codesearch "GlideRecord" --limit 10
+
+# Search only business rules
+bash scripts/sn.sh codesearch "current.update()" --table sys_script
+
+# Search scripted REST operations
+bash scripts/sn.sh codesearch "request.body" --table sys_ws_operation --field operation_script
+
+# Find references to a specific table
+bash scripts/sn.sh codesearch "incident" --limit 30
+```
+
+### sn_discover — Table & App Discovery
+
+```bash
+bash scripts/sn.sh discover <tables|apps|plugins> [options]
+```
+
+Discover tables, applications, and plugins installed on the instance.
+
+**Subcommands:**
+
+#### `discover tables` — Search for tables
+Options:
+- `--query <name>` — Search by table name or label (LIKE match)
+- `--limit <n>` — Max results (default 20)
+
+```bash
+# Find tables related to incidents
+bash scripts/sn.sh discover tables --query "incident"
+
+# Find CMDB tables
+bash scripts/sn.sh discover tables --query "cmdb"
+
+# List tables with a large limit
+bash scripts/sn.sh discover tables --limit 50
+```
+
+#### `discover apps` — Search installed applications
+Options:
+- `--query <name>` — Filter by app name (LIKE match)
+- `--limit <n>` — Max results (default 20)
+- `--active <true|false>` — Only active apps (default: true)
+
+Searches both scoped apps (`sys_app`) and store apps (`sys_store_app`).
+
+```bash
+# List active applications
+bash scripts/sn.sh discover apps --limit 10
+
+# Search for a specific app
+bash scripts/sn.sh discover apps --query "ITSM"
+
+# Include inactive apps
+bash scripts/sn.sh discover apps --active false
+```
+
+#### `discover plugins` — Search plugins
+Options:
+- `--query <name>` — Filter by plugin name (LIKE match)
+- `--limit <n>` — Max results (default 20)
+- `--active <true|false>` — Only active plugins (default: all)
+
+```bash
+# List all plugins
+bash scripts/sn.sh discover plugins --limit 50
+
+# Search for CMDB plugins
+bash scripts/sn.sh discover plugins --query "CMDB"
+
+# Only active plugins
+bash scripts/sn.sh discover plugins --active true --query "Discovery"
+```
+
 ### sn_attach — Manage attachments
 
 ```bash
@@ -375,6 +573,136 @@ ServiceNow encoded queries use `^` as AND, `^OR` as OR:
 - `assigned_toISEMPTY` — Unassigned
 - `stateIN1,2,3` — State is 1, 2, or 3
 - `caller_id.name=John Smith` — Dot-walk through references
+
+### sn_atf — Automated Test Framework
+
+Find and run ATF tests and test suites.
+
+```bash
+bash scripts/sn.sh atf <list|suites|run|run-suite|results> [options]
+```
+
+**Subcommands:**
+
+#### `atf list` — List ATF tests
+
+```bash
+bash scripts/sn.sh atf list [--suite <name>] [--query <filter>] [--limit <N>] [--fields <fields>]
+```
+
+Options:
+- `--suite "<name>"` — Filter tests belonging to a specific suite (by name)
+- `--query "<encoded_query>"` — ServiceNow encoded query filter
+- `--limit <n>` — Max records (default 20)
+- `--fields "<field1,field2>"` — Fields to return (default: sys_id,name,description,active,sys_updated_on)
+
+Examples:
+
+```bash
+# List first 10 ATF tests
+bash scripts/sn.sh atf list --limit 10
+
+# Active tests only
+bash scripts/sn.sh atf list --query "active=true" --limit 20
+
+# Tests in a specific suite
+bash scripts/sn.sh atf list --suite "My Quick Start Tests"
+```
+
+#### `atf suites` — List ATF test suites
+
+```bash
+bash scripts/sn.sh atf suites [--query <filter>] [--limit <N>] [--fields <fields>]
+```
+
+Options:
+- `--query "<encoded_query>"` — ServiceNow encoded query filter
+- `--limit <n>` — Max records (default 20)
+- `--fields "<field1,field2>"` — Fields to return (default: sys_id,name,description,active)
+
+Examples:
+
+```bash
+# List all suites
+bash scripts/sn.sh atf suites --limit 50
+
+# Active suites only
+bash scripts/sn.sh atf suites --query "active=true"
+```
+
+#### `atf run` — Run a single ATF test
+
+```bash
+bash scripts/sn.sh atf run <test_sys_id> [--wait] [--no-wait] [--timeout <seconds>]
+```
+
+Executes a single ATF test by sys_id. Polls for completion by default.
+
+Options:
+- `--wait` — Poll until complete (default)
+- `--no-wait` — Trigger and return immediately
+- `--timeout <seconds>` — Max wait time (default 120)
+
+The command tries multiple API endpoints in order:
+1. `POST /api/sn_atf/rest/test` (scoped ATF API)
+2. `POST /api/now/atf/test/{sys_id}/run` (platform ATF API)
+3. Table API fallback (creates scheduled result record)
+
+Example:
+
+```bash
+bash scripts/sn.sh atf run abc123def456 --timeout 60
+```
+
+#### `atf run-suite` — Run an ATF test suite
+
+```bash
+bash scripts/sn.sh atf run-suite <suite_sys_id> [--wait] [--no-wait] [--timeout <seconds>]
+```
+
+Executes an entire ATF test suite. Returns a summary with pass/fail/skip counts.
+
+Options:
+- `--wait` — Poll until complete (default)
+- `--no-wait` — Trigger and return immediately
+- `--timeout <seconds>` — Max wait time (default 300)
+
+Output (JSON):
+```json
+{
+  "suite_sys_id": "abc123...",
+  "summary": {"total": 10, "passed": 8, "failed": 1, "skipped": 1},
+  "results": [...]
+}
+```
+
+Example:
+
+```bash
+bash scripts/sn.sh atf run-suite abc123def456 --timeout 180
+```
+
+#### `atf results` — Get test/suite execution results
+
+```bash
+bash scripts/sn.sh atf results <execution_id> [--fields <fields>] [--limit <N>]
+```
+
+Fetches results for a specific test execution or suite run.
+
+Options:
+- `--fields "<field1,field2>"` — Fields to return (default: sys_id,test,status,output,duration,start_time,end_time)
+- `--limit <n>` — Max results (default 50)
+
+Examples:
+
+```bash
+# Get a single test result
+bash scripts/sn.sh atf results abc123def456
+
+# Get all results for a suite execution
+bash scripts/sn.sh atf results suite_sys_id_here --limit 100
+```
 
 ## Notes
 

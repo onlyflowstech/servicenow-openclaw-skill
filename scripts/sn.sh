@@ -9,7 +9,7 @@
 # License: MIT
 # ──────────────────────────────────────────────────────────────────────
 # Usage: bash sn.sh <command> [args...]
-# Commands: query, get, create, update, delete, aggregate, schema, attach, batch, health, nl, relationships
+# Commands: query, get, create, update, delete, aggregate, schema, attach, batch, health, nl, script, relationships
 set -euo pipefail
 
 # ── Configuration ──────────────────────────────────────────────────────
@@ -1586,22 +1586,953 @@ cmd_relationships() {
   unset -f _rel_get_class _rel_field_value _rel_field_display _rel_field_id_from_link _rel_traverse
 }
 
+# ── script ─────────────────────────────────────────────────────────────
+cmd_script() {
+  local script_code="" script_file="" timeout=30 scope="global" confirm=false
+  local MAX_TIMEOUT=300
+  local MAX_SIZE=51200  # 50KB in bytes
+
+  # Destructive keywords that require --confirm
+  local DESTRUCTIVE_PATTERNS='deleteRecord|deleteMultiple|\.delete\(\)|GlideRecord\.delete|setWorkflow\(false\)'
+
+  # Parse arguments
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --file)    script_file="$2"; shift 2 ;;
+      --timeout) timeout="$2";     shift 2 ;;
+      --scope)   scope="$2";       shift 2 ;;
+      --confirm) confirm=true;     shift ;;
+      -*)        die "Unknown option: $1" ;;
+      *)
+        if [[ -z "$script_code" ]]; then
+          script_code="$1"
+        else
+          die "Unexpected argument: $1 (wrap script in quotes)"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  # ── Load script from file or inline ─────────────────────────────
+  if [[ -n "$script_file" ]]; then
+    [[ ! -f "$script_file" ]] && die "Script file not found: $script_file"
+    script_code=$(cat "$script_file") || die "Failed to read script file: $script_file"
+    info "Loaded script from: $script_file"
+  fi
+
+  [[ -z "$script_code" ]] && die "Usage: sn.sh script '<javascript code>' [--file <path>] [--timeout <seconds>] [--scope <app_scope>] [--confirm]"
+
+  # ── Validate timeout ────────────────────────────────────────────
+  if ! [[ "$timeout" =~ ^[0-9]+$ ]]; then
+    die "Timeout must be a positive integer (got: $timeout)"
+  fi
+  if (( timeout > MAX_TIMEOUT )); then
+    info "WARNING: Capping timeout from ${timeout}s to ${MAX_TIMEOUT}s"
+    timeout=$MAX_TIMEOUT
+  fi
+  if (( timeout < 1 )); then
+    timeout=1
+  fi
+
+  # ── Validate script size ────────────────────────────────────────
+  local script_size
+  script_size=$(printf '%s' "$script_code" | wc -c)
+  if (( script_size > MAX_SIZE )); then
+    die "Script exceeds maximum size: ${script_size} bytes > ${MAX_SIZE} bytes (50KB limit)"
+  fi
+
+  # ── Compute script hash for audit trail ─────────────────────────
+  local script_hash
+  script_hash=$(printf '%s' "$script_code" | sha256sum | cut -c1-8)
+
+  # ── Safety: check for destructive keywords ──────────────────────
+  if echo "$script_code" | grep -qE "$DESTRUCTIVE_PATTERNS"; then
+    if [[ "$confirm" != "true" ]]; then
+      echo "🛑 DESTRUCTIVE SCRIPT DETECTED" >&2
+      echo "" >&2
+      echo "This script contains potentially destructive operations:" >&2
+      echo "$script_code" | grep -nE "$DESTRUCTIVE_PATTERNS" | head -5 | while IFS= read -r line; do
+        echo "  $line" >&2
+      done
+      echo "" >&2
+      die "Destructive scripts require --confirm flag. This is a safety measure."
+    fi
+    info "WARNING: Destructive script confirmed by user"
+  fi
+
+  # ── Safety warning ──────────────────────────────────────────────
+  echo "⚠️  WARNING: Executing server-side background script on ${SN_INSTANCE}" >&2
+  echo "   Scope: ${scope} | Timeout: ${timeout}s | Size: ${script_size} bytes | Hash: ${script_hash}" >&2
+  echo "" >&2
+
+  info "POST background script (hash=${script_hash}, scope=${scope})"
+
+  # ── Build request body ──────────────────────────────────────────
+  local body
+  body=$(jq -n --arg s "$script_code" '{"script": $s}')
+
+  # ── Try primary endpoint: /api/now/sys/script/background ────────
+  local url="${SN_INSTANCE}/api/now/sys/script/background"
+  local resp http_code
+
+  # Add scope header if not global
+  local scope_header=()
+  if [[ "$scope" != "global" ]]; then
+    scope_header=(-H "X-App-Scope: ${scope}")
+  fi
+
+  # Use curl with full error handling (not sn_curl, we need http_code)
+  resp=$(curl -s -w "\n%{http_code}" -X POST "$url" \
+    -u "$AUTH" \
+    -H "Accept: application/json" \
+    -H "Content-Type: application/json" \
+    "${scope_header[@]}" \
+    --max-time "$timeout" \
+    -d "$body" 2>&1) || {
+    local curl_exit=$?
+    if [[ $curl_exit -eq 28 ]]; then
+      die "Script execution timed out after ${timeout}s"
+    else
+      die "curl failed with exit code $curl_exit"
+    fi
+  }
+
+  http_code=$(echo "$resp" | tail -1)
+  local resp_body
+  resp_body=$(echo "$resp" | sed '$d')
+
+  # ── If primary endpoint fails, try fallbacks ─────────────────────
+  # 400 = "URI does not represent any resource", 404/405 = not found/not allowed
+  if [[ "$http_code" == "400" || "$http_code" == "404" || "$http_code" == "405" ]]; then
+    info "Primary endpoint not available (HTTP $http_code), trying fallback..."
+
+    # Fallback 1: /api/sn_script/run (Scripted REST API)
+    url="${SN_INSTANCE}/api/sn_script/run"
+    resp=$(curl -s -w "\n%{http_code}" -X POST "$url" \
+      -u "$AUTH" \
+      -H "Accept: application/json" \
+      -H "Content-Type: application/json" \
+      "${scope_header[@]}" \
+      --max-time "$timeout" \
+      -d "$body" 2>&1) || {
+      local curl_exit=$?
+      if [[ $curl_exit -eq 28 ]]; then
+        die "Script execution timed out after ${timeout}s"
+      else
+        die "curl failed with exit code $curl_exit"
+      fi
+    }
+
+    http_code=$(echo "$resp" | tail -1)
+    resp_body=$(echo "$resp" | sed '$d')
+  fi
+
+  if [[ "$http_code" == "400" || "$http_code" == "404" || "$http_code" == "405" ]]; then
+    info "Fallback 1 not available (HTTP $http_code), trying ScriptEvaluator endpoint..."
+
+    # Fallback 2: /api/now/script/evaluator (GlideScriptEvaluator)
+    url="${SN_INSTANCE}/api/now/script/evaluator"
+    resp=$(curl -s -w "\n%{http_code}" -X POST "$url" \
+      -u "$AUTH" \
+      -H "Accept: application/json" \
+      -H "Content-Type: application/json" \
+      "${scope_header[@]}" \
+      --max-time "$timeout" \
+      -d "$body" 2>&1) || {
+      local curl_exit=$?
+      if [[ $curl_exit -eq 28 ]]; then
+        die "Script execution timed out after ${timeout}s"
+      else
+        die "curl failed with exit code $curl_exit"
+      fi
+    }
+
+    http_code=$(echo "$resp" | tail -1)
+    resp_body=$(echo "$resp" | sed '$d')
+  fi
+
+  if [[ "$http_code" == "400" || "$http_code" == "404" || "$http_code" == "405" ]]; then
+    info "Fallback 2 not available (HTTP $http_code), trying sys_script_execution..."
+
+    # Fallback 3: /api/now/table/sys_script_execution (legacy)
+    url="${SN_INSTANCE}/api/now/table/sys_script_execution"
+    local legacy_body
+    legacy_body=$(jq -n --arg s "$script_code" --arg sc "$scope" \
+      '{"script": $s, "scope": $sc}')
+
+    resp=$(curl -s -w "\n%{http_code}" -X POST "$url" \
+      -u "$AUTH" \
+      -H "Accept: application/json" \
+      -H "Content-Type: application/json" \
+      --max-time "$timeout" \
+      -d "$legacy_body" 2>&1) || {
+      local curl_exit=$?
+      if [[ $curl_exit -eq 28 ]]; then
+        die "Script execution timed out after ${timeout}s"
+      else
+        die "curl failed with exit code $curl_exit"
+      fi
+    }
+
+    http_code=$(echo "$resp" | tail -1)
+    resp_body=$(echo "$resp" | sed '$d')
+  fi
+
+  # ── Handle HTTP errors ──────────────────────────────────────────
+  if [[ "$http_code" -ge 400 ]]; then
+    local error_msg
+    error_msg=$(echo "$resp_body" | jq -r '.error.message // .error // empty' 2>/dev/null)
+    local error_detail
+    error_detail=$(echo "$resp_body" | jq -r '.error.detail // empty' 2>/dev/null)
+
+    if [[ -n "$error_msg" ]]; then
+      echo "ERROR: HTTP $http_code — $error_msg" >&2
+      [[ -n "$error_detail" ]] && echo "Detail: $error_detail" >&2
+    else
+      echo "ERROR: HTTP $http_code" >&2
+      echo "$resp_body" >&2
+    fi
+    exit 1
+  fi
+
+  # ── Parse and display response ──────────────────────────────────
+  # Try to extract script output from various response formats
+  local output=""
+
+  # Format 1: {result: {output: "..."}}
+  output=$(echo "$resp_body" | jq -r '.result.output // empty' 2>/dev/null)
+
+  # Format 2: {result: "..."}  (direct string)
+  if [[ -z "$output" ]]; then
+    output=$(echo "$resp_body" | jq -r 'if .result | type == "string" then .result else empty end' 2>/dev/null)
+  fi
+
+  # Format 3: {result: {value: "..."}}
+  if [[ -z "$output" ]]; then
+    output=$(echo "$resp_body" | jq -r '.result.value // empty' 2>/dev/null)
+  fi
+
+  # Format 4: raw body is the output (some endpoints return plain text)
+  if [[ -z "$output" ]]; then
+    # Check if the response is valid JSON with a result
+    if echo "$resp_body" | jq -e '.result' >/dev/null 2>&1; then
+      output=$(echo "$resp_body" | jq -r '.result' 2>/dev/null)
+    else
+      output="$resp_body"
+    fi
+  fi
+
+  # Build structured output
+  local result
+  result=$(jq -n \
+    --arg status "success" \
+    --arg hash "$script_hash" \
+    --arg scope "$scope" \
+    --arg instance "$SN_INSTANCE" \
+    --arg output "$output" \
+    --argjson http "$http_code" \
+    --argjson size "$script_size" \
+    '{
+      status: $status,
+      http_code: $http,
+      script_hash: $hash,
+      script_size_bytes: $size,
+      scope: $scope,
+      instance: $instance,
+      output: $output
+    }')
+
+  echo "$result" | jq .
+  info "Script executed successfully (hash=${script_hash}, HTTP ${http_code})"
+}
+
+# ── syslog ─────────────────────────────────────────────────────────────
+cmd_syslog() {
+  local level="" source="" message="" query="" limit="25" since="60"
+  local fields="sys_id,level,source,message,sys_created_on"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --level)   level="$2";   shift 2 ;;
+      --source)  source="$2";  shift 2 ;;
+      --message) message="$2"; shift 2 ;;
+      --query)   query="$2";   shift 2 ;;
+      --limit)   limit="$2";   shift 2 ;;
+      --since)   since="$2";   shift 2 ;;
+      --fields)  fields="$2";  shift 2 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+
+  # Build query from individual filters (unless raw --query overrides)
+  local sysparm_query=""
+  if [[ -n "$query" ]]; then
+    sysparm_query="$query"
+  else
+    local parts=()
+    [[ -n "$level" ]]   && parts+=("level=${level}")
+    [[ -n "$source" ]]  && parts+=("sourceLIKE${source}")
+    [[ -n "$message" ]] && parts+=("messageLIKE${message}")
+    parts+=("sys_created_on>=javascript:gs.minutesAgoStart(${since})")
+    sysparm_query=$(IFS='^'; echo "${parts[*]}")
+  fi
+
+  # Always order by newest first
+  sysparm_query+="^ORDERBYDESCsys_created_on"
+
+  local encoded_q
+  encoded_q=$(jq -rn --arg v "$sysparm_query" '$v | @uri')
+  local url="${SN_INSTANCE}/api/now/table/syslog?sysparm_query=${encoded_q}&sysparm_fields=${fields}&sysparm_limit=${limit}"
+
+  info "GET syslog (limit=$limit, since=${since}m)"
+  local resp
+  resp=$(sn_curl GET "$url") || die "API request failed"
+
+  local count
+  count=$(echo "$resp" | jq '.result | length')
+
+  # Format output: show timestamp, level, source, message
+  echo "$resp" | jq '[.result[] | {
+    sys_id,
+    timestamp: .sys_created_on,
+    level,
+    source,
+    message: (if (.message | length) > 300 then (.message[:300] + "...") else .message end)
+  }]'
+  info "Returned $count log entries"
+}
+
+# ── codesearch ─────────────────────────────────────────────────────────
+cmd_codesearch() {
+  local search_term="" table="" field="" limit="20"
+
+  # First positional arg is the search term
+  if [[ $# -gt 0 && "$1" != --* ]]; then
+    search_term="$1"; shift
+  fi
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --table) table="$2"; shift 2 ;;
+      --field) field="$2"; shift 2 ;;
+      --limit) limit="$2"; shift 2 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+
+  [[ -z "$search_term" ]] && die "Usage: sn.sh codesearch <search_term> [--table <table>] [--field <field>] [--limit N]"
+
+  # Define default search targets: table:field pairs
+  local -a search_tables=()
+  local -a search_fields=()
+  local -a search_labels=()
+
+  if [[ -n "$table" ]]; then
+    search_tables+=("$table")
+    search_fields+=("${field:-script}")
+    search_labels+=("$table")
+  else
+    search_tables+=("sys_script" "sys_script_include" "sys_ui_script" "sys_script_client" "sys_ws_operation")
+    search_fields+=("script"     "script"              "script"        "script"            "operation_script")
+    search_labels+=("Business Rules" "Script Includes" "UI Scripts" "Client Scripts" "Scripted REST")
+  fi
+
+  local all_results='[]'
+  local total_found=0
+  local per_table_limit=$(( limit ))
+
+  # If searching multiple tables, distribute limit
+  local num_tables=${#search_tables[@]}
+  if [[ $num_tables -gt 1 ]]; then
+    per_table_limit=$(( (limit + num_tables - 1) / num_tables ))
+    [[ $per_table_limit -lt 5 ]] && per_table_limit=5
+  fi
+
+  for i in "${!search_tables[@]}"; do
+    local t="${search_tables[$i]}"
+    local f="${search_fields[$i]}"
+    local l="${search_labels[$i]}"
+
+    local q="${f}LIKE${search_term}"
+    local encoded_q
+    encoded_q=$(jq -rn --arg v "$q" '$v | @uri')
+    local url="${SN_INSTANCE}/api/now/table/${t}?sysparm_query=${encoded_q}&sysparm_fields=sys_id,name,${f}&sysparm_limit=${per_table_limit}"
+
+    info "Searching $l ($t) for '${search_term}'..."
+    local resp
+    resp=$(sn_curl GET "$url" 2>/dev/null) || { info "Warning: Failed to query $t"; continue; }
+
+    local count
+    count=$(echo "$resp" | jq '.result | length')
+    total_found=$(( total_found + count ))
+
+    if [[ "$count" -gt 0 ]]; then
+      # Add table context and code snippet to each result
+      local table_results
+      table_results=$(echo "$resp" | jq --arg tbl "$t" --arg lbl "$l" --arg fld "$f" \
+        '[.result[] | {
+          table: $tbl,
+          table_label: $lbl,
+          sys_id,
+          name: (.name // "unnamed"),
+          snippet: (if (.[$fld] | length) > 200 then (.[$fld][:200] + "...") else (.[$fld] // "") end)
+        }]')
+      all_results=$(echo "$all_results $table_results" | jq -s '.[0] + .[1]')
+    fi
+  done
+
+  # Trim to requested limit
+  all_results=$(echo "$all_results" | jq --argjson lim "$limit" '.[:$lim]')
+  local final_count
+  final_count=$(echo "$all_results" | jq 'length')
+
+  echo "$all_results" | jq '.'
+  info "Found $total_found match(es) across ${num_tables} table(s), showing $final_count"
+}
+
+# ── discover ───────────────────────────────────────────────────────────
+cmd_discover() {
+  local subcmd="${1:?Usage: sn.sh discover <tables|apps|plugins> [options]}"
+  shift
+
+  case "$subcmd" in
+    tables)
+      local query="" limit="20"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --query) query="$2"; shift 2 ;;
+          --limit) limit="$2"; shift 2 ;;
+          *) die "Unknown option: $1" ;;
+        esac
+      done
+
+      local fields="sys_id,name,label,super_class,sys_scope,is_extendable"
+      local sysparm_query=""
+      if [[ -n "$query" ]]; then
+        sysparm_query="nameLIKE${query}^ORlabelLIKE${query}"
+      fi
+
+      local url="${SN_INSTANCE}/api/now/table/sys_db_object?sysparm_fields=${fields}&sysparm_limit=${limit}&sysparm_display_value=true"
+      [[ -n "$sysparm_query" ]] && url+="&sysparm_query=$(jq -rn --arg v "$sysparm_query" '$v | @uri')"
+
+      info "Discovering tables (limit=$limit)"
+      local resp
+      resp=$(sn_curl GET "$url") || die "API request failed"
+
+      local count
+      count=$(echo "$resp" | jq '.result | length')
+      echo "$resp" | jq '[.result[] | {
+        sys_id,
+        name,
+        label,
+        super_class,
+        scope: .sys_scope,
+        is_extendable
+      }]'
+      info "Found $count table(s)"
+      ;;
+
+    apps)
+      local query="" limit="20" active="true"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --query)  query="$2";  shift 2 ;;
+          --limit)  limit="$2";  shift 2 ;;
+          --active) active="$2"; shift 2 ;;
+          *) die "Unknown option: $1" ;;
+        esac
+      done
+
+      local all_apps='[]'
+
+      # Search scoped apps (sys_app)
+      local app_fields="sys_id,name,version,scope,active"
+      local app_query=""
+      [[ -n "$query" ]]              && app_query="nameLIKE${query}"
+      [[ "$active" == "true" ]]      && { [[ -n "$app_query" ]] && app_query+="^"; app_query+="active=true"; }
+
+      local app_url="${SN_INSTANCE}/api/now/table/sys_app?sysparm_fields=${app_fields}&sysparm_limit=${limit}"
+      [[ -n "$app_query" ]] && app_url+="&sysparm_query=$(jq -rn --arg v "$app_query" '$v | @uri')"
+
+      info "Discovering scoped apps..."
+      local app_resp
+      if app_resp=$(sn_curl GET "$app_url" 2>/dev/null); then
+        local scoped
+        scoped=$(echo "$app_resp" | jq '[.result[] | . + {source: "scoped"}]')
+        all_apps=$(echo "$all_apps $scoped" | jq -s '.[0] + .[1]')
+      else
+        info "Warning: Could not query sys_app (may require elevated role)"
+      fi
+
+      # Search store apps (sys_store_app)
+      local store_query=""
+      [[ -n "$query" ]]              && store_query="nameLIKE${query}"
+      [[ "$active" == "true" ]]      && { [[ -n "$store_query" ]] && store_query+="^"; store_query+="active=true"; }
+
+      local store_url="${SN_INSTANCE}/api/now/table/sys_store_app?sysparm_fields=${app_fields}&sysparm_limit=${limit}"
+      [[ -n "$store_query" ]] && store_url+="&sysparm_query=$(jq -rn --arg v "$store_query" '$v | @uri')"
+
+      info "Discovering store apps..."
+      local store_resp
+      if store_resp=$(sn_curl GET "$store_url" 2>/dev/null); then
+        local store_apps
+        store_apps=$(echo "$store_resp" | jq '[.result[] | . + {source: "store"}]')
+        all_apps=$(echo "$all_apps $store_apps" | jq -s '.[0] + .[1]')
+      else
+        info "Warning: Could not query sys_store_app"
+      fi
+
+      local total
+      total=$(echo "$all_apps" | jq 'length')
+      # Trim to limit
+      all_apps=$(echo "$all_apps" | jq --argjson lim "$limit" '.[:$lim]')
+      echo "$all_apps" | jq '.'
+      info "Found $total app(s)"
+      ;;
+
+    plugins)
+      local query="" limit="20" active=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --query)  query="$2";  shift 2 ;;
+          --limit)  limit="$2";  shift 2 ;;
+          --active) active="$2"; shift 2 ;;
+          *) die "Unknown option: $1" ;;
+        esac
+      done
+
+      local plugin_query=""
+      [[ -n "$query" ]]   && plugin_query="nameLIKE${query}"
+      [[ -n "$active" ]]  && { [[ -n "$plugin_query" ]] && plugin_query+="^"; plugin_query+="active=${active}"; }
+
+      local plugin_fields="sys_id,name,active"
+      local plugin_url="${SN_INSTANCE}/api/now/table/v_plugin?sysparm_fields=${plugin_fields}&sysparm_limit=${limit}"
+      [[ -n "$plugin_query" ]] && plugin_url+="&sysparm_query=$(jq -rn --arg v "$plugin_query" '$v | @uri')"
+
+      info "Discovering plugins (limit=$limit)"
+      local resp
+      resp=$(sn_curl GET "$plugin_url") || die "API request failed"
+
+      local count
+      count=$(echo "$resp" | jq '.result | length')
+      echo "$resp" | jq '[.result[] | {sys_id, name, active}]'
+      info "Found $count plugin(s)"
+      ;;
+
+    *) die "Unknown discover subcommand: $subcmd (use tables, apps, plugins)" ;;
+  esac
+}
+
+# ── atf (Automated Test Framework) ──────────────────────────────────────
+cmd_atf() {
+  local subcmd="${1:?Usage: sn.sh atf <list|suites|run|run-suite|results> ...}"
+  shift
+
+  case "$subcmd" in
+    # ── atf list — List ATF tests ────────────────────────────────────
+    list)
+      local query="" fields="sys_id,name,description,active,sys_updated_on" limit="20" suite=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --suite)  suite="$2";  shift 2 ;;
+          --query)  query="$2";  shift 2 ;;
+          --limit)  limit="$2";  shift 2 ;;
+          --fields) fields="$2"; shift 2 ;;
+          *) die "Unknown option: $1" ;;
+        esac
+      done
+
+      # If --suite given, resolve the suite sys_id by name and filter tests
+      if [[ -n "$suite" ]]; then
+        info "Resolving suite: $suite"
+        local suite_encoded
+        suite_encoded=$(jq -rn --arg v "name=$suite" '$v | @uri')
+        local suite_resp
+        suite_resp=$(sn_curl GET "${SN_INSTANCE}/api/now/table/sys_atf_test_suite?sysparm_query=${suite_encoded}&sysparm_fields=sys_id,name&sysparm_limit=1") \
+          || die "Failed to resolve suite: $suite"
+        local suite_id
+        suite_id=$(echo "$suite_resp" | jq -r '.result[0].sys_id // empty')
+        [[ -z "$suite_id" ]] && die "Suite not found: $suite"
+        info "Suite resolved: $suite_id"
+
+        # Query sys_atf_test_suite_test (M2M table) for test sys_ids in suite
+        local m2m_resp
+        m2m_resp=$(sn_curl GET "${SN_INSTANCE}/api/now/table/sys_atf_test_suite_test?sysparm_query=test_suite=${suite_id}&sysparm_fields=test&sysparm_limit=500") \
+          || die "Failed to query suite tests"
+        local test_ids
+        test_ids=$(echo "$m2m_resp" | jq -r '[.result[].test] | join(",")' 2>/dev/null)
+        if [[ -z "$test_ids" || "$test_ids" == "null" ]]; then
+          echo '{"record_count":0,"results":[]}'
+          info "No tests found in suite: $suite"
+          return 0
+        fi
+        # Build IN clause for test sys_ids
+        local suite_filter="sys_idIN${test_ids}"
+        if [[ -n "$query" ]]; then
+          query="${suite_filter}^${query}"
+        else
+          query="$suite_filter"
+        fi
+      fi
+
+      local url="${SN_INSTANCE}/api/now/table/sys_atf_test?sysparm_limit=${limit}&sysparm_fields=${fields}"
+      [[ -n "$query" ]] && url+="&sysparm_query=$(jq -rn --arg v "$query" '$v | @uri')"
+
+      info "GET sys_atf_test (limit=$limit)"
+      local resp
+      resp=$(sn_curl GET "$url") || die "API request failed"
+      local count
+      count=$(echo "$resp" | jq '.result | length')
+      echo "$resp" | jq '{record_count: (.result | length), results: .result}'
+      info "Returned $count test(s)"
+      ;;
+
+    # ── atf suites — List ATF test suites ────────────────────────────
+    suites)
+      local query="" fields="sys_id,name,description,active" limit="20"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --query)  query="$2";  shift 2 ;;
+          --limit)  limit="$2";  shift 2 ;;
+          --fields) fields="$2"; shift 2 ;;
+          *) die "Unknown option: $1" ;;
+        esac
+      done
+
+      local url="${SN_INSTANCE}/api/now/table/sys_atf_test_suite?sysparm_limit=${limit}&sysparm_fields=${fields}"
+      [[ -n "$query" ]] && url+="&sysparm_query=$(jq -rn --arg v "$query" '$v | @uri')"
+
+      info "GET sys_atf_test_suite (limit=$limit)"
+      local resp
+      resp=$(sn_curl GET "$url") || die "API request failed"
+      local count
+      count=$(echo "$resp" | jq '.result | length')
+      echo "$resp" | jq '{record_count: (.result | length), results: .result}'
+      info "Returned $count suite(s)"
+      ;;
+
+    # ── atf run — Run a single ATF test ──────────────────────────────
+    run)
+      local test_id="${1:?Usage: sn.sh atf run <test_sys_id> [--wait] [--timeout <seconds>]}"
+      shift
+      local wait=true timeout=120
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --wait)    wait=true;     shift ;;
+          --no-wait) wait=false;    shift ;;
+          --timeout) timeout="$2";  shift 2 ;;
+          *) die "Unknown option: $1" ;;
+        esac
+      done
+
+      info "Running ATF test: $test_id"
+
+      # Try the ATF REST API: POST /api/sn_atf/rest/test
+      local run_url="${SN_INSTANCE}/api/sn_atf/rest/test"
+      local run_resp http_code
+
+      http_code=$(curl -s -o /tmp/sn_atf_run_resp.json -w "%{http_code}" \
+        -X POST "$run_url" \
+        -u "$AUTH" \
+        -H "Accept: application/json" \
+        -H "Content-Type: application/json" \
+        -d "{\"test_id\":\"${test_id}\"}")
+
+      if [[ "$http_code" == "200" || "$http_code" == "201" ]]; then
+        run_resp=$(cat /tmp/sn_atf_run_resp.json)
+        info "Test execution triggered via sn_atf REST API"
+      else
+        # Fallback: try /api/now/atf/test/{sys_id}/run
+        info "sn_atf API returned HTTP $http_code, trying alternative endpoint..."
+        http_code=$(curl -s -o /tmp/sn_atf_run_resp.json -w "%{http_code}" \
+          -X POST "${SN_INSTANCE}/api/now/atf/test/${test_id}/run" \
+          -u "$AUTH" \
+          -H "Accept: application/json" \
+          -H "Content-Type: application/json")
+
+        if [[ "$http_code" == "200" || "$http_code" == "201" ]]; then
+          run_resp=$(cat /tmp/sn_atf_run_resp.json)
+          info "Test execution triggered via /api/now/atf"
+        else
+          # Fallback: schedule run by inserting into sys_atf_test_result
+          info "REST APIs not available (HTTP $http_code). Scheduling test run via Table API..."
+          local schedule_payload
+          schedule_payload=$(jq -n --arg tid "$test_id" '{test: $tid, status: "scheduled"}')
+          run_resp=$(sn_curl POST "${SN_INSTANCE}/api/now/table/sys_atf_test_result" -d "$schedule_payload" 2>/dev/null) || true
+
+          if [[ -z "$run_resp" ]]; then
+            cat /tmp/sn_atf_run_resp.json 2>/dev/null
+            die "All ATF execution methods failed. Ensure the ATF plugin is active and your user has atf_admin role."
+          fi
+          info "Test run scheduled via Table API"
+        fi
+      fi
+      rm -f /tmp/sn_atf_run_resp.json
+
+      # Extract result tracker (sys_id or tracker_id from response)
+      local result_id tracker_id
+      result_id=$(echo "$run_resp" | jq -r '.result.sys_id // .result.result_id // empty' 2>/dev/null)
+      tracker_id=$(echo "$run_resp" | jq -r '.result.tracker_id // .result.progress_id // empty' 2>/dev/null)
+
+      if [[ "$wait" != "true" ]]; then
+        echo "$run_resp" | jq '.'
+        [[ -n "$result_id" ]] && info "Result ID: $result_id"
+        [[ -n "$tracker_id" ]] && info "Tracker ID: $tracker_id"
+        info "Test triggered (not waiting for completion)"
+        return 0
+      fi
+
+      # Poll for completion
+      info "Waiting for test completion (timeout: ${timeout}s)..."
+      local elapsed=0 poll_interval=5
+      local status=""
+
+      while (( elapsed < timeout )); do
+        sleep "$poll_interval"
+        elapsed=$((elapsed + poll_interval))
+
+        # Try to poll result by result_id
+        if [[ -n "$result_id" ]]; then
+          local poll_resp
+          poll_resp=$(sn_curl GET "${SN_INSTANCE}/api/now/table/sys_atf_test_result/${result_id}?sysparm_fields=sys_id,test,status,output,duration,start_time,end_time&sysparm_display_value=true" 2>/dev/null) || true
+          status=$(echo "$poll_resp" | jq -r '.result.status // empty' 2>/dev/null)
+        elif [[ -n "$tracker_id" ]]; then
+          # Poll via tracker
+          local tracker_resp
+          tracker_resp=$(sn_curl GET "${SN_INSTANCE}/api/now/table/sys_execution_tracker/${tracker_id}?sysparm_fields=state,result,message&sysparm_display_value=true" 2>/dev/null) || true
+          local tracker_state
+          tracker_state=$(echo "$tracker_resp" | jq -r '.result.state // empty' 2>/dev/null)
+          if [[ "$tracker_state" == "Successful" || "$tracker_state" == "Failed" || "$tracker_state" == "Cancelled" ]]; then
+            status="complete"
+          fi
+        else
+          # Poll by test sys_id — find the most recent result
+          local poll_resp
+          poll_resp=$(sn_curl GET "${SN_INSTANCE}/api/now/table/sys_atf_test_result?sysparm_query=test=${test_id}^ORDERBYDESCsys_created_on&sysparm_fields=sys_id,test,status,output,duration,start_time,end_time&sysparm_display_value=true&sysparm_limit=1" 2>/dev/null) || true
+          status=$(echo "$poll_resp" | jq -r '.result[0].status // empty' 2>/dev/null)
+          result_id=$(echo "$poll_resp" | jq -r '.result[0].sys_id // empty' 2>/dev/null)
+        fi
+
+        # Check completion statuses
+        local status_lower
+        status_lower=$(echo "$status" | tr '[:upper:]' '[:lower:]')
+        if [[ "$status_lower" == "success" || "$status_lower" == "pass" || "$status_lower" == "passed" \
+            || "$status_lower" == "failure" || "$status_lower" == "fail" || "$status_lower" == "failed" \
+            || "$status_lower" == "error" || "$status_lower" == "complete" || "$status_lower" == "skipped" \
+            || "$status_lower" == "cancelled" ]]; then
+          info "Test completed: $status (${elapsed}s)"
+          break
+        fi
+
+        printf "." >&2
+      done
+      echo "" >&2
+
+      if (( elapsed >= timeout )); then
+        info "⚠️  Timeout reached (${timeout}s) — test may still be running"
+      fi
+
+      # Fetch final result
+      if [[ -n "$result_id" ]]; then
+        local final_resp
+        final_resp=$(sn_curl GET "${SN_INSTANCE}/api/now/table/sys_atf_test_result/${result_id}?sysparm_fields=sys_id,test,status,output,duration,start_time,end_time&sysparm_display_value=true" 2>/dev/null) || true
+        echo "$final_resp" | jq '.result'
+      else
+        echo "$run_resp" | jq '.'
+      fi
+      ;;
+
+    # ── atf run-suite — Run an ATF test suite ────────────────────────
+    run-suite)
+      local suite_id="${1:?Usage: sn.sh atf run-suite <suite_sys_id> [--wait] [--timeout <seconds>]}"
+      shift
+      local wait=true timeout=300
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --wait)    wait=true;     shift ;;
+          --no-wait) wait=false;    shift ;;
+          --timeout) timeout="$2";  shift 2 ;;
+          *) die "Unknown option: $1" ;;
+        esac
+      done
+
+      info "Running ATF test suite: $suite_id"
+
+      # Try the ATF REST API: POST /api/sn_atf/rest/suite
+      local run_url="${SN_INSTANCE}/api/sn_atf/rest/suite"
+      local run_resp http_code
+
+      http_code=$(curl -s -o /tmp/sn_atf_suite_resp.json -w "%{http_code}" \
+        -X POST "$run_url" \
+        -u "$AUTH" \
+        -H "Accept: application/json" \
+        -H "Content-Type: application/json" \
+        -d "{\"suite_id\":\"${suite_id}\"}")
+
+      if [[ "$http_code" == "200" || "$http_code" == "201" ]]; then
+        run_resp=$(cat /tmp/sn_atf_suite_resp.json)
+        info "Suite execution triggered via sn_atf REST API"
+      else
+        # Fallback: try /api/now/atf/suite/{sys_id}/run
+        info "sn_atf API returned HTTP $http_code, trying alternative endpoint..."
+        http_code=$(curl -s -o /tmp/sn_atf_suite_resp.json -w "%{http_code}" \
+          -X POST "${SN_INSTANCE}/api/now/atf/suite/${suite_id}/run" \
+          -u "$AUTH" \
+          -H "Accept: application/json" \
+          -H "Content-Type: application/json")
+
+        if [[ "$http_code" == "200" || "$http_code" == "201" ]]; then
+          run_resp=$(cat /tmp/sn_atf_suite_resp.json)
+          info "Suite execution triggered via /api/now/atf"
+        else
+          cat /tmp/sn_atf_suite_resp.json 2>/dev/null
+          die "Suite execution failed (HTTP $http_code). Ensure the ATF plugin is active and your user has atf_admin role."
+        fi
+      fi
+      rm -f /tmp/sn_atf_suite_resp.json
+
+      # Extract tracking info
+      local result_id tracker_id
+      result_id=$(echo "$run_resp" | jq -r '.result.sys_id // .result.result_id // empty' 2>/dev/null)
+      tracker_id=$(echo "$run_resp" | jq -r '.result.tracker_id // .result.progress_id // empty' 2>/dev/null)
+
+      if [[ "$wait" != "true" ]]; then
+        echo "$run_resp" | jq '.'
+        [[ -n "$result_id" ]] && info "Result ID: $result_id"
+        [[ -n "$tracker_id" ]] && info "Tracker ID: $tracker_id"
+        info "Suite triggered (not waiting for completion)"
+        return 0
+      fi
+
+      # Poll for completion
+      info "Waiting for suite completion (timeout: ${timeout}s)..."
+      local elapsed=0 poll_interval=5
+      local completed=false
+
+      while (( elapsed < timeout )); do
+        sleep "$poll_interval"
+        elapsed=$((elapsed + poll_interval))
+
+        if [[ -n "$tracker_id" ]]; then
+          local tracker_resp
+          tracker_resp=$(sn_curl GET "${SN_INSTANCE}/api/now/table/sys_execution_tracker/${tracker_id}?sysparm_fields=state,result,message,completion_percent&sysparm_display_value=true" 2>/dev/null) || true
+          local tracker_state
+          tracker_state=$(echo "$tracker_resp" | jq -r '.result.state // empty' 2>/dev/null)
+          local pct
+          pct=$(echo "$tracker_resp" | jq -r '.result.completion_percent // empty' 2>/dev/null)
+          [[ -n "$pct" ]] && printf "\r  Progress: %s%%" "$pct" >&2
+          if [[ "$tracker_state" == "Successful" || "$tracker_state" == "Failed" || "$tracker_state" == "Cancelled" ]]; then
+            completed=true
+            echo "" >&2
+            info "Suite completed: $tracker_state (${elapsed}s)"
+            break
+          fi
+        else
+          printf "." >&2
+        fi
+      done
+      [[ "$completed" != "true" ]] && echo "" >&2
+
+      if (( elapsed >= timeout )); then
+        info "⚠️  Timeout reached (${timeout}s) — suite may still be running"
+      fi
+
+      # Fetch suite results — query test results linked to this suite execution
+      local results_query="test_suite=${suite_id}^ORDERBYDESCsys_created_on"
+      local results_url="${SN_INSTANCE}/api/now/table/sys_atf_test_result?sysparm_query=$(jq -rn --arg v "$results_query" '$v | @uri')&sysparm_fields=sys_id,test,status,output,duration,start_time,end_time&sysparm_display_value=true&sysparm_limit=200"
+
+      local results_resp
+      results_resp=$(sn_curl GET "$results_url" 2>/dev/null) || true
+
+      local total_tests passed failed skipped
+      total_tests=$(echo "$results_resp" | jq '.result | length' 2>/dev/null || echo "0")
+      passed=$(echo "$results_resp" | jq '[.result[] | select(.status == "Success" or .status == "Pass" or .status == "Passed")] | length' 2>/dev/null || echo "0")
+      failed=$(echo "$results_resp" | jq '[.result[] | select(.status == "Failure" or .status == "Fail" or .status == "Failed" or .status == "Error")] | length' 2>/dev/null || echo "0")
+      skipped=$(echo "$results_resp" | jq '[.result[] | select(.status == "Skipped" or .status == "Cancelled")] | length' 2>/dev/null || echo "0")
+
+      # Build summary output
+      local summary
+      summary=$(jq -n \
+        --arg sid "$suite_id" \
+        --argjson total "$total_tests" \
+        --argjson pass "$passed" \
+        --argjson fail "$failed" \
+        --argjson skip "$skipped" \
+        '{suite_sys_id: $sid, summary: {total: $total, passed: $pass, failed: $fail, skipped: $skip}}')
+
+      # Append individual results
+      if [[ "$total_tests" -gt 0 ]]; then
+        summary=$(echo "$summary" | jq --argjson r "$(echo "$results_resp" | jq '.result')" '. + {results: $r}')
+      fi
+
+      echo "$summary" | jq '.'
+      info "Suite results: $passed passed, $failed failed, $skipped skipped (of $total_tests)"
+      ;;
+
+    # ── atf results — Get test/suite execution results ───────────────
+    results)
+      local execution_id="${1:?Usage: sn.sh atf results <execution_id> [--fields <fields>] [--limit <N>]}"
+      shift
+      local fields="sys_id,test,status,output,duration,start_time,end_time" limit="50"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --fields) fields="$2"; shift 2 ;;
+          --limit)  limit="$2";  shift 2 ;;
+          *) die "Unknown option: $1" ;;
+        esac
+      done
+
+      info "Fetching ATF results for: $execution_id"
+
+      # First try: direct get by sys_id (single test result)
+      local resp
+      resp=$(sn_curl GET "${SN_INSTANCE}/api/now/table/sys_atf_test_result/${execution_id}?sysparm_fields=${fields}&sysparm_display_value=true" 2>/dev/null) || true
+      local got_single
+      got_single=$(echo "$resp" | jq -r '.result.sys_id // empty' 2>/dev/null)
+
+      if [[ -n "$got_single" ]]; then
+        echo "$resp" | jq '.result'
+        info "Returned 1 result record"
+        return 0
+      fi
+
+      # Second try: query by execution_id or parent field
+      local query="execution=${execution_id}^ORparent=${execution_id}^ORtest_suite=${execution_id}"
+      local query_url="${SN_INSTANCE}/api/now/table/sys_atf_test_result?sysparm_query=$(jq -rn --arg v "$query" '$v | @uri')&sysparm_fields=${fields}&sysparm_display_value=true&sysparm_limit=${limit}"
+
+      resp=$(sn_curl GET "$query_url") || die "Failed to query results"
+      local count
+      count=$(echo "$resp" | jq '.result | length')
+      echo "$resp" | jq '{record_count: (.result | length), results: .result}'
+      info "Returned $count result(s)"
+      ;;
+
+    *) die "Unknown atf subcommand: $subcmd (use list, suites, run, run-suite, results)" ;;
+  esac
+}
+
 # ── Main dispatcher ────────────────────────────────────────────────────
-cmd="${1:?Usage: sn.sh <query|get|create|update|delete|aggregate|schema|attach|batch|health|nl> ...}"
+cmd="${1:?Usage: sn.sh <query|get|create|update|delete|aggregate|schema|attach|batch|health|nl|script|relationships|syslog|codesearch|discover|atf> ...}"
 shift
 
 case "$cmd" in
-  query)     cmd_query "$@" ;;
-  get)       cmd_get "$@" ;;
-  create)    cmd_create "$@" ;;
-  update)    cmd_update "$@" ;;
-  delete)    cmd_delete "$@" ;;
-  aggregate) cmd_aggregate "$@" ;;
-  schema)    cmd_schema "$@" ;;
-  attach)    cmd_attach "$@" ;;
-  batch)     cmd_batch "$@" ;;
-  health)    cmd_health "$@" ;;
+  query)         cmd_query "$@" ;;
+  get)           cmd_get "$@" ;;
+  create)        cmd_create "$@" ;;
+  update)        cmd_update "$@" ;;
+  delete)        cmd_delete "$@" ;;
+  aggregate)     cmd_aggregate "$@" ;;
+  schema)        cmd_schema "$@" ;;
+  attach)        cmd_attach "$@" ;;
+  batch)         cmd_batch "$@" ;;
+  health)        cmd_health "$@" ;;
   nl)            cmd_nl "$@" ;;
+  script)        cmd_script "$@" ;;
   relationships) cmd_relationships "$@" ;;
+  syslog)        cmd_syslog "$@" ;;
+  codesearch)    cmd_codesearch "$@" ;;
+  discover)      cmd_discover "$@" ;;
+  atf)           cmd_atf "$@" ;;
   *)             die "Unknown command: $cmd" ;;
 esac
